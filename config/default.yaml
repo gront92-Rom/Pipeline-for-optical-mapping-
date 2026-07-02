@@ -31,11 +31,20 @@ mask:
 # --- Preprocessing ---
 preprocess:
   spatial_sigma: 2.0
-  temporal_cutoff_hz: 80.0
+  # Dual-stage LPF (v6): cutoff depends on target_stage passed to preprocess_video().
+  # activation: 80 Hz  — suppress noise before upstroke (dV/dt) detection
+  # apd:        150 Hz — preserve repolarization tail morphology
+  lp_cutoff_activation_hz: 80.0
+  lp_cutoff_apd_hz: 150.0
   chunk_size: 8192
   overlap: 256
   normalize_method: "percentile"
   normalize_q: 10.0
+  # ASLS baseline correction (Eilers & Boelens 2005).
+  # Applied AFTER inversion (p=0.01 expects peaks pointing up).
+  asls_lam: 1.0e8    # Smoothness of estimated baseline (higher = smoother)
+  asls_p: 0.01       # Asymmetry weight (0.01 = lower envelope)
+  asls_niter: 3      # Number of ASLS iterations
 
 # --- Activation ---
 activation:
