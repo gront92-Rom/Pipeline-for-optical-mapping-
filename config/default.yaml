@@ -42,8 +42,10 @@ activation:
   methods:
     - "50pct"
     - "derivative_max"
-    - "template_match"
-    - "polynomial_fit"
+    - "vectorized_interp"
+  window_offset: 50            # frames before peak for analysis window
+  retry_window_offset: 80      # larger window for retry on WARN
+  min_peaks: 3                 # minimum peaks required
   tat_min_ms: 5.0
   tat_max_ms: 100.0
   beat_pass_rate_reject: 0.3
