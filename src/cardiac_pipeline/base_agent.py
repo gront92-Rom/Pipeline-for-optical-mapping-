@@ -62,7 +62,7 @@ class PipelineConfig:
         self.data_root = Path(self._get("data_root", "data"))
         # NOTE: fps is NEVER a silent default — metadata_extractor raises if not found.
         # pixel_size_mm: canonical for MiCAM ULTIMA ×10 (from .bvx or fallback)
-        self.pixel_size_mm = float(self._get("pixel_size_mm", 0.85))
+        self.pixel_size_mm = float(self._get("pixel_size_mm", 0.085))
         
         # Вложенные секции
         self.loader = self._get("loader", {})

@@ -14,7 +14,7 @@ data_root: "data"
 # fps_default: 666.67  # DO NOT USE — metadata_extractor enforces extraction
 
 # Pixel size: canonical value for MiCAM ULTIMA ×10 objective
-pixel_size_mm: 0.85
+pixel_size_mm: 0.085
 
 # --- Loader ---
 loader:

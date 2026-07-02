@@ -442,9 +442,9 @@ def extract_micam_metadata(
         warnings.append("dimensions not found in header")
 
     if not merged.get("pixel_size_mm"):
-        merged["pixel_size_mm"] = 0.85
-        merged["pixel_size_source"] = "fallback_default_0.85mm_x10"
-        warnings.append("pixel_size_mm missing in .bvx; using fallback 0.85 mm (MiCAM ULTIMA ×10)")
+        merged["pixel_size_mm"] = 0.085
+        merged["pixel_size_source"] = "fallback_default_0.085mm_x10"
+        warnings.append("pixel_size_mm missing in .bvx; using fallback 0.085 mm (MiCAM ULTIMA ×10)")
 
     warn_validate = _validate_frame_count(merged, directory, base_name)
     if warn_validate:
