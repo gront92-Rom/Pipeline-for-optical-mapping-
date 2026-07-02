@@ -1,0 +1,81 @@
+# =============================================================================
+# Cardiac Optical Mapping Pipeline — Default Configuration
+# =============================================================================
+# All thresholds and parameters centralized here.
+# Agents MUST NOT hardcode these values.
+
+# --- Paths ---
+results_root: "results"
+data_root: "data"
+
+# --- Calibration (from metadata_extractor, NOT used as silent fallback) ---
+# NOTE: fps is ALWAYS read from .rsh/.gsh/.bvx via metadata_extractor.
+# This field exists only for documentation; agents must raise if fps is missing.
+# fps_default: 666.67  # DO NOT USE — metadata_extractor enforces extraction
+
+# Pixel size: canonical value for MiCAM ULTIMA ×10 objective
+pixel_size_mm: 0.85
+
+# --- Loader ---
+loader:
+  crop_left: 20
+  crop_right: 8
+  bytes_per_pixel: 2
+
+# --- Mask ---
+mask:
+  composite_threshold: 0.5
+  min_area_fraction: 0.05
+  contour_lpf_sigma: 2.0
+
+# --- Preprocessing ---
+preprocess:
+  spatial_sigma: 2.0
+  temporal_cutoff_hz: 80.0
+  chunk_size: 8192
+  overlap: 256
+  normalize_method: "percentile"
+  normalize_q: 10.0
+
+# --- Activation ---
+activation:
+  methods:
+    - "50pct"
+    - "derivative_max"
+    - "template_match"
+    - "polynomial_fit"
+  tat_min_ms: 5.0
+  tat_max_ms: 100.0
+  beat_pass_rate_reject: 0.3
+
+# --- APD ---
+apd:
+  levels: [30, 50, 80]
+  apd_min_ms: 5.0
+  apd_max_ms: 500.0
+  poly_order: 5
+  search_window_ms: 50.0
+
+# --- Conduction Velocity ---
+conduction:
+  method: "filled_hybrid"
+  coherence_threshold: 0.1
+  integration_sigma: 4.0
+  cap: 5.0
+  cv_min_m_per_s: 0.05
+  cv_max_m_per_s: 2.0
+  use_fallback: true
+
+# --- Alternans ---
+alternans:
+  min_beats: 4
+  ac_pct_thresholds: [5, 10, 20]
+  f_dom_target: 0.5
+  f_dom_tolerance: 0.1
+  sign_floor_ms: 0.5
+  discordant_threshold: 0.25
+
+# --- QC / Judge ---
+qc:
+  peak_thr_frac_floor: 0.3
+  min_beats_floor: 2
