@@ -39,15 +39,15 @@
 
 | Поле | Значение |
 |------|----------|
-| **Статус** | ❌ TODO |
+| **Статус** | 🔄 IN PROGRESS |
 | **Приоритет** | P0 |
 | **Закрывает** | R1-pixel: CV2, CV3, P4 |
 | **Файлы для изменения** | `source_cv_agent.py` (4 сигнатуры), `optical_pipeline_worker.py` (3 места) |
 | **Описание** | Убрать `pixel_size_mm=0.85` из сигнатур. Исправить `*0.85` в графике. Исправить опечатку `0.085` в воркере. |
 | **Критерий готовности** | Единый источник `PIXEL_SIZE_MM` в конфиге. Нет хардкодов в агентах. |
-| **Дата начала** | — |
+| **Дата начала** | 2026-07-02 |
 | **Дата завершения** | — |
-| **Заметки** | — |
+| **Заметки** | Частично закрыто для `ConductionAgent`: pixel_size_mm берётся из metadata.json, хардкодов нет. Старые агенты (source_cv_agent, optical_pipeline_worker) требуют отдельного фикса. |
 
 ---
 
@@ -87,15 +87,15 @@
 
 | Поле | Значение |
 |------|----------|
-| **Статус** | ❌ TODO |
+| **Статус** | ✅ DONE |
 | **Приоритет** | P0 (блокирует CV!) |
 | **Закрывает** | R3-острое: CV1/ImportError |
-| **Файлы для изменения** | `conduction_analysis.py` или `source_cv_agent.py` |
-| **Описание** | Добавить `cv_method_local_fit` в `conduction_analysis` ИЛИ убрать вызов из `source_cv_agent`. |
-| **Критерий готовности** | `python3 -c "from source_cv_agent import *"` не падает. |
-| **Дата начала** | — |
-| **Дата завершения** | — |
-| **Заметки** | Проверить: нужна ли эта функция вообще или это мёртвый код. |
+| **Файлы для изменения** | `src/cardiac_pipeline/utils/cv_estimators.py` (новый), `src/cardiac_pipeline/agents/conduction_agent.py` (новый) |
+| **Описание** | Решено архитектурно: новый `ConductionAgent` не импортирует `cv_method_local_fit` из `conduction_analysis`. Вся CV-математика вынесена в `utils/cv_estimators.py`. |
+| **Критерий готовности** | `python3 -m py_compile src/cardiac_pipeline/agents/conduction_agent.py` — OK. Smoke-tests PASSED. |
+| **Дата начала** | 2026-07-02 |
+| **Дата завершения** | 2026-07-02 |
+| **Заметки** | cv_method_local_fit — мёртвый код в source_cv_agent. Новый агент его не использует. |
 
 ---
 

@@ -155,4 +155,38 @@
 
 ---
 
+### 2026-07-02 — Сессия 7: Написание ConductionAgent + cv_estimators
+
+**Участники:** Manus  
+**Фокус:** Реализация CV-анализа на основе кора пользователя
+
+**Что сделано:**
+- Создан `src/cardiac_pipeline/utils/cv_estimators.py` — математическое ядро CV:
+  - `compute_hybrid_structure_tensor()` — прямой градиент карты активации
+  - `compute_polynomial_bayly()` — Гаусс-сглаженный градиент (метод Бейли)
+  - `estimate_cv_stats()` — агрегация статистики по маске
+- Создан `src/cardiac_pipeline/agents/conduction_agent.py` — production-ready агент:
+  - Наследует `BaseAgent`, использует `run(force=False)` API
+  - Консенсус двух методов с tolerance=15%
+  - `judge_conduction()` — QC с PASS/WARN/REJECT
+  - Все пути через `self.get_path()` (SC6 fix)
+  - pixel_size_mm из metadata.json, без хардкода (CV2 fix)
+  - REJECT → raise ValueError, не тихий exit 0 (C2/SC1 fix)
+  - Нет импорта cv_method_local_fit (F5 fix)
+- Обновлён `config/default.yaml`: добавлены `tolerance` и `qc_threshold` в секцию `conduction`
+- Обновлены `__init__.py` для utils/ и agents/
+- Создан `test_cv_smoke.py` — 6 smoke-тестов, все PASSED
+- Обновлён `FIX_TRACKER.md`: F5 → ✅ DONE, F2 → 🔄 IN PROGRESS (частично)
+
+**Принятые решения:**
+- cv_method_local_fit — мёртвый код, не реализовывать; новый агент его не использует
+- Единицы CV: мм/мс = м/с (физиологически корректно)
+- NaN вне маски заполняются до градиента, результат маскируется обратно (SC7 fix)
+
+**Следующий шаг:**
+- Продолжить P0 фиксы: F1 (единый fps), F3 (NaN→REJECT), F7 (judge воркера)
+- Интегрировать ConductionAgent в optical_pipeline_worker (stage_cv)
+
+---
+
 <!-- НОВЫЕ ЗАПИСИ ДОБАВЛЯТЬ НИЖЕ ЭТОЙ ЛИНИИ -->

@@ -62,10 +62,12 @@ apd:
 conduction:
   method: "filled_hybrid"
   coherence_threshold: 0.1
-  integration_sigma: 4.0
+  integration_sigma: 4.0   # Gaussian sigma for Bayly method (pixels)
   cap: 5.0
-  cv_min_m_per_s: 0.05
-  cv_max_m_per_s: 2.0
+  cv_min_m_per_s: 0.05     # Physiological lower bound (m/s = mm/ms)
+  cv_max_m_per_s: 2.0      # Physiological upper bound (m/s = mm/ms)
+  tolerance: 0.15          # Max relative difference between methods for consensus
+  qc_threshold: 0.20       # Min valid tissue fraction for PASS (else REJECT)
   use_fallback: true
 
 # --- Alternans ---
