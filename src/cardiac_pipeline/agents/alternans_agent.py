@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-alternans_agent.py — Stage 5: Детекция и анализ альтернанса.
+alternans_agent.py — Stage 7: Детекция и анализ альтернанса.
 Версия v1 (2026-07-02).
 
 Архитектура:
@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 
 class AlternansAgent(BaseAgent):
     """
-    Stage 5: Детекция и анализ альтернанса потенциала действия / CaT.
+    Stage 7: Детекция и анализ альтернанса потенциала действия / CaT.
 
     Потребляет apd_per_beat_3d.npz от APDAgent.
     Генерирует карты амплитуды, фазы, конкордантности и клинический фенотип.
@@ -411,7 +411,7 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="AlternansAgent standalone — Stage 5")
+    parser = argparse.ArgumentParser(description="AlternansAgent standalone — Stage 7")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
     parser.add_argument("--results-root", default="results", help="Results root directory")
     parser.add_argument("--force", action="store_true", help="Force recompute")

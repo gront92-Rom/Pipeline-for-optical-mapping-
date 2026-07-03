@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-apd_agent.py — Stage 4: Расчёт длительности потенциала действия / CaT (APD/CaT Map).
+apd_agent.py — Stage 6: Расчёт длительности потенциала действия / CaT (APD/CaT Map).
 Версия v1 (2026-07-02).
 
 Архитектура:
@@ -20,7 +20,7 @@ apd_agent.py — Stage 4: Расчёт длительности потенциа
     - apd30_map.npy / cat30_map.npy   — медианная карта APD30/CaT30 (мс)
     - apd50_map.npy / cat50_map.npy   — медианная карта APD50/CaT50 (мс)
     - apd80_map.npy / cat80_map.npy   — медианная карта APD80/CaT80 (мс)
-    - apd_per_beat_3d.npz             — 3D стек (H, W, N_beats) для Stage 5 (Альтернанс)
+    - apd_per_beat_3d.npz             — 3D стек (H, W, N_beats) для Stage 7 (Альтернанс)
     - apd_report.json                 — вердикт, метрики, параметры
   DEBUG:
     - apd30_map.png / apd50_map.png / apd80_map.png — PNG-карты
@@ -72,10 +72,10 @@ logger = logging.getLogger(__name__)
 
 class APDAgent(BaseAgent):
     """
-    Stage 4: Расчёт карт APD/CaT и 3D стека биений.
+    Stage 6: Расчёт карт APD/CaT и 3D стека биений.
 
     Потребляет препроцессированное видео + пики от PeakDetectorAgent.
-    Генерирует карты APD30/50/80 (или CaT30/50/80) и 3D стек для Stage 5.
+    Генерирует карты APD30/50/80 (или CaT30/50/80) и 3D стек для Stage 7.
     """
 
     def __init__(
@@ -397,7 +397,7 @@ class APDAgent(BaseAgent):
         self.save_must(apd50_map, f"{m}50_map.npy")
         self.save_must(apd80_map, f"{m}80_map.npy")
 
-        # 3D стек для Stage 5 (Альтернанс)
+        # 3D стек для Stage 7 (Альтернанс)
         npz_path = self.must_dir / "apd_per_beat_3d.npz"
         np.savez_compressed(
             npz_path,
@@ -553,7 +553,7 @@ if __name__ == "__main__":
     import argparse
     import sys
 
-    parser = argparse.ArgumentParser(description="APDAgent standalone — Stage 4")
+    parser = argparse.ArgumentParser(description="APDAgent standalone — Stage 6")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
     parser.add_argument("--results-root", default="results", help="Results root directory")
     parser.add_argument("--force", action="store_true", help="Force recompute even if output exists")

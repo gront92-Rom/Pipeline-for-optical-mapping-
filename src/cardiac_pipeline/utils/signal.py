@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-signal.py — Математическое ядро расчёта APD/CaT (Stage 4).
+signal.py — Математическое ядро расчёта APD/CaT (Stage 6).
 Версия v1 (2026-07-02).
 
 Функции:
