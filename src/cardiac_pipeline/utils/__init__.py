@@ -6,4 +6,5 @@ Modules:
     preprocess: Video preprocessing (spatial smooth, temporal lowpass, inversion, ASLS)
     cv_estimators: CV calculation kernels (hybrid structure tensor + polynomial Bayly)
     signal: APD/CaT math kernels (ROI pooling, upstroke, repolarization, corner ROI, QC)
+    alternans: Alternans analysis kernels (spatial amplitude/phase, concordance, FFT, Poincaré)
 """
