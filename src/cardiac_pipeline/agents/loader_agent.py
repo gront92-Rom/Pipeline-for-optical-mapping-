@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""
+loader_agent.py — Stage 1: Загрузка данных, извлечение метаданных, предобработка.
+Версия v2 (2026-07-02).
+
+Архитектура:
+  Наследует BaseAgent. Читает параметры из PipelineConfig (config/default.yaml).
+  Делегирует парсинг — utils/metadata_extractor.py.
+  Делегирует предобработку — utils/preprocess.py v6.
+
+Входные данные:
+  - Путь к файлу данных (.bvx / .rsh / .gsh / .npy) или директории с ними.
+    Передаётся в run(input_path=...).
+
+Выходные данные:
+  MUST:
+    - raw_video.npy          — сырое видео float32 (T, H, W) после кропа
+    - preproc_video.npy      — препроцессированное видео (activation, 80 Гц)
+    - preproc_video_apd.npy  — препроцессированное видео (apd, 150 Гц)
+    - metadata.json          — полные метаданные (fps, dye, pixel_size_mm, ...)
+  DEBUG (только при sideline-режиме):
+    - sideline_trace.npy     — усреднённый трейс центрального ROI (длинные записи)
+
+Режимы:
+  "full"     — стандартная обработка (< sideline_threshold кадров)
+  "sideline" — только трейс центрального ROI (>= sideline_threshold кадров)
+
+Коды возврата (CLI-режим):
+  0 = SUCCESS
+  1 = CRASH (исключение инфраструктуры)
+  2 = REJECT (файл не найден / метаданные неполные)
+
+Исправления относительно исходного loader_agent.py:
+  - from base_agent import → from cardiac_pipeline.base_agent import
+  - from preprocess_v5 import → from cardiac_pipeline.utils.preprocess import
+  - from metadata_extractor_v3 import → from cardiac_pipeline.utils.metadata_extractor import
+  - save_meta() → save_must() (BaseAgent не имеет save_meta)
+  - save_must("loaded_video.npy", ...) → save_must(data, "preproc_video.npy")
+    (имя согласовано с PeakDetectorAgent, который ищет preproc_video.npy)
+  - Добавлена двойная предобработка: activation (80 Гц) + apd (150 Гц)
+  - Добавлен кроп (crop_left / crop_right из конфига)
+  - Параметры из PipelineConfig (не из argparse)
+  - REJECT → raise ValueError (BaseAgent-контракт)
+  - sideline_threshold из конфига (не хардкод 4096)
+  - Добавлен raw_video.npy (сырые данные до предобработки)
+"""
+
+import json
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+
+import numpy as np
+
+from cardiac_pipeline.base_agent import BaseAgent, PipelineConfig
+from cardiac_pipeline.utils.metadata_extractor import extract_micam_metadata
+from cardiac_pipeline.utils.preprocess import preprocess_video
+
+logger = logging.getLogger(__name__)
+
+# Форматы, которые можно загрузить напрямую через numpy (без optimap)
+_NPY_EXTENSIONS = {".npy", ".npz"}
+
+
+# ---------------------------------------------------------------------------
+# LoaderAgent
+# ---------------------------------------------------------------------------
+
+class LoaderAgent(BaseAgent):
+    """
+    Stage 1: Загрузка сырых данных MiCAM ULTIMA, извлечение метаданных,
+    двойная предобработка (activation 80 Гц + APD 150 Гц).
+
+    Потребляет: файл данных (.bvx/.rsh/.gsh/.npy) или директорию.
+    Производит: raw_video.npy, preproc_video.npy, preproc_video_apd.npy, metadata.json.
+    """
+
+    def __init__(
+        self,
+        sample_id: str,
+        config: Optional[PipelineConfig] = None,
+    ):
+        super().__init__(sample_id, config)
+
+        loader_cfg = self.config.loader if isinstance(self.config.loader, dict) else {}
+        preproc_cfg = self.config.preprocess if isinstance(self.config.preprocess, dict) else {}
+
+        # Кроп (пиксели, убираем артефакты краёв матрицы)
+        self.crop_left:  int = int(loader_cfg.get("crop_left",  20))
+        self.crop_right: int = int(loader_cfg.get("crop_right",  8))
+
+        # Порог sideline-режима (кадры)
+        self.sideline_threshold: int = int(loader_cfg.get("sideline_threshold", 4096))
+
+        # Параметры предобработки
+        self.spatial_sigma:    float = float(preproc_cfg.get("spatial_sigma",    2.0))
+        self.chunk_size:       int   = int(preproc_cfg.get("chunk_size",        8192))
+        self.overlap:          int   = int(preproc_cfg.get("overlap",            256))
+        self.lp_cutoff_act:    float = float(preproc_cfg.get("lp_cutoff_activation_hz", 80.0))
+        self.lp_cutoff_apd:    float = float(preproc_cfg.get("lp_cutoff_apd_hz",       150.0))
+        self.asls_lam:         float = float(preproc_cfg.get("asls_lam",         1e8))
+        self.asls_p:           float = float(preproc_cfg.get("asls_p",           0.01))
+        self.asls_niter:       int   = int(preproc_cfg.get("asls_niter",         3))
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------------
+
+    def _load_video(self, input_path: Path) -> np.ndarray:
+        """
+        Загружает видео из файла.
+
+        Поддерживаемые форматы:
+          .npy / .npz — numpy напрямую
+          .bvx / .rsh / .gsh — через optimap (MiCAM ULTIMA)
+        """
+        ext = input_path.suffix.lower()
+
+        if ext in _NPY_EXTENSIONS:
+            self.logger.info(f"Загружаю numpy: {input_path.name}")
+            data = np.load(str(input_path), allow_pickle=True)
+            if isinstance(data, np.lib.npyio.NpzFile):
+                # Берём первый массив из npz
+                key = list(data.keys())[0]
+                return data[key].astype(np.float32)
+            return data.astype(np.float32)
+
+        # Попытка загрузить через optimap
+        try:
+            import optimap as om
+            self.logger.info(f"Загружаю через optimap: {input_path.name}")
+            return om.load_video(str(input_path)).astype(np.float32)
+        except ImportError:
+            raise ImportError(
+                "optimap не установлен. Для загрузки .bvx/.rsh/.gsh файлов "
+                "выполните: pip install opticalmapping"
+            )
+        except Exception as e:
+            raise RuntimeError(f"Ошибка загрузки {input_path}: {e}") from e
+
+    def _crop_video(self, video: np.ndarray) -> np.ndarray:
+        """Убирает артефактные пиксели по краям матрицы (crop_left / crop_right)."""
+        _, H, W = video.shape
+        cl, cr = self.crop_left, self.crop_right
+        if cl + cr >= W:
+            self.logger.warning(
+                f"crop_left={cl} + crop_right={cr} >= W={W} — кроп пропущен"
+            )
+            return video
+        cropped = video[:, :, cl: W - cr] if cr > 0 else video[:, :, cl:]
+        self.logger.info(f"Кроп: W {W} → {cropped.shape[2]} (left={cl}, right={cr})")
+        return cropped
+
+    def _extract_metadata(self, input_path: Path) -> Dict[str, Any]:
+        """
+        Извлекает метаданные из .bvx/.rsh/.gsh или строит минимальный словарь для .npy.
+        Всегда сохраняет metadata.json в must/.
+        """
+        ext = input_path.suffix.lower()
+
+        if ext in _NPY_EXTENSIONS:
+            # Для .npy файлов метаданные недоступны — строим минимальный словарь
+            self.logger.warning(
+                "Входной файл .npy — метаданные недоступны. "
+                "fps и dye будут взяты из конфига или останутся None."
+            )
+            meta = {
+                "sample_id":     self.sample_id,
+                "source_file":   str(input_path),
+                "fps":           self.config.loader.get("default_fps") if isinstance(self.config.loader, dict) else None,
+                "dye":           self.config.loader.get("default_dye") if isinstance(self.config.loader, dict) else None,
+                "pixel_size_mm": self.config.pixel_size_mm,
+                "source":        "npy_fallback",
+            }
+        else:
+            # Полное извлечение из MiCAM-файлов
+            meta = extract_micam_metadata(
+                input_path.parent,
+                base_name=input_path.stem,
+                write_json=False,  # Мы сами сохраним через save_must
+            )
+            meta["sample_id"] = self.sample_id
+            meta["source_file"] = str(input_path)
+
+        # Всегда записываем в must/metadata.json
+        self.save_must(meta, "metadata.json")
+        return meta
+
+    def _handle_sideline(self, video: np.ndarray, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sideline-режим для длинных записей (>= sideline_threshold кадров).
+        Сохраняет только усреднённый трейс центрального 3×3 ROI.
+        """
+        T, H, W = video.shape
+        cy, cx = H // 2, W // 2
+        y0, y1 = max(0, cy - 1), min(H, cy + 2)
+        x0, x1 = max(0, cx - 1), min(W, cx + 2)
+        trace = np.mean(video[:, y0:y1, x0:x1], axis=(1, 2)).astype(np.float32)
+        self.save_debug(trace, "sideline_trace.npy")
+        self.logger.warning(
+            f"Sideline-режим: {T} кадров >= порога {self.sideline_threshold}. "
+            "Сохранён только центральный трейс."
+        )
+        return {
+            "status":   "sideline",
+            "n_frames": T,
+            "shape":    list(video.shape),
+        }
+
+    # ------------------------------------------------------------------
+    # Главный метод
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        input_path: Optional[Union[str, Path]] = None,
+        force: bool = False,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """
+        Запускает полный цикл загрузки и предобработки.
+
+        Порядок:
+          1. Проверка кэша (если preproc_video.npy уже есть — пропускаем)
+          2. Разрешение пути к входному файлу
+          3. Извлечение метаданных → metadata.json
+          4. Загрузка видео + кроп
+          5. Сохранение raw_video.npy
+          6. Sideline-гейтинг (длинные записи)
+          7. Предобработка activation (80 Гц) → preproc_video.npy
+          8. Предобработка APD (150 Гц) → preproc_video_apd.npy
+          9. Сохранение метрик
+
+        Параметры:
+            input_path — путь к файлу данных или директории.
+                         Если None — ищет файл в стандартном месте
+                         (results_root/<sample_id>/raw/).
+            force      — перезаписать даже если выходные файлы существуют.
+        """
+        if not force and self.exists("preproc_video.npy", kind="debug"):
+            self.logger.info("preproc_video.npy exists, skipping LoaderAgent")
+            return {"status": "skipped"}
+
+        t0 = time.perf_counter()
+
+        # --- 2. Разрешение пути ---
+        if input_path is None:
+            # Ищем в стандартном месте: results_root/<sample_id>/raw/
+            raw_dir = Path(self.config.results_root) / self.sample_id / "raw"
+            candidates = list(raw_dir.glob("*.bvx")) + list(raw_dir.glob("*.npy"))
+            if not candidates:
+                raise ValueError(
+                    f"input_path не указан и файлы не найдены в {raw_dir}. "
+                    "Передайте input_path явно в run()."
+                )
+            input_path = candidates[0]
+            self.logger.info(f"Автообнаружение файла: {input_path}")
+
+        input_path = Path(input_path)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Входной файл не найден: {input_path}")
+
+        # --- 3. Метаданные ---
+        self.logger.info(f"Извлекаю метаданные из {input_path}")
+        metadata = self._extract_metadata(input_path)
+
+        fps = metadata.get("fps")
+        dye = metadata.get("dye")
+
+        if fps is None:
+            raise ValueError(
+                "fps не найден в метаданных. Убедитесь, что .rsh/.gsh файл "
+                "присутствует рядом с .bvx, или укажите default_fps в config/loader."
+            )
+        fps = float(fps)
+
+        # --- 4. Загрузка видео + кроп ---
+        self.logger.info(f"Загружаю видео: {input_path.name}")
+        video = self._load_video(input_path)
+        video = self._crop_video(video)
+        T, H, W = video.shape
+        self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}")
+
+        # --- 5. Сохранение сырого видео ---
+        self.save_must(video, "raw_video.npy")
+
+        # --- 6. Sideline-гейтинг ---
+        if T >= self.sideline_threshold:
+            result = self._handle_sideline(video, metadata)
+            elapsed = round(time.perf_counter() - t0, 2)
+            result["elapsed_s"] = elapsed
+            self._log_metrics({"loader_mode": "sideline", "n_frames": T, "elapsed_s": elapsed})
+            return result
+
+        # --- 7. Предобработка activation (80 Гц) ---
+        self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц)...")
+        preproc_act = preprocess_video(
+            video=video,
+            fps=fps,
+            mask=None,              # Маска ещё не готова (MaskAgent идёт после)
+            target_stage="activation",
+            lp_cutoff=self.lp_cutoff_act,
+            sigma=self.spatial_sigma,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            dye=dye,
+            do_asls=False,          # ASLS требует маску — откладываем до MaskAgent
+            do_normalize=True,
+        )
+        self.save_debug(preproc_act, "preproc_video.npy")
+
+        # --- 8. Предобработка APD (150 Гц) ---
+        self.logger.info(f"Предобработка APD (LPF={self.lp_cutoff_apd} Гц)...")
+        preproc_apd = preprocess_video(
+            video=video,
+            fps=fps,
+            mask=None,
+            target_stage="apd",
+            lp_cutoff=self.lp_cutoff_apd,
+            sigma=self.spatial_sigma,
+            chunk_size=self.chunk_size,
+            overlap=self.overlap,
+            dye=dye,
+            do_asls=False,
+            do_normalize=True,
+        )
+        self.save_debug(preproc_apd, "preproc_video_apd.npy")
+
+        # --- 9. Метрики ---
+        elapsed = round(time.perf_counter() - t0, 2)
+        self._log_metrics({
+            "loader_mode":   "full",
+            "n_frames":      T,
+            "height":        H,
+            "width":         W,
+            "fps":           fps,
+            "dye":           dye,
+            "elapsed_s":     elapsed,
+        })
+
+        self.logger.info(
+            f"LoaderAgent done in {elapsed}s — "
+            f"video={video.shape}, fps={fps}, dye={dye}"
+        )
+
+        return {
+            "status":  "success",
+            "shape":   list(video.shape),
+            "fps":     fps,
+            "dye":     dye,
+            "elapsed_s": elapsed,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="LoaderAgent standalone — Stage 1")
+    parser.add_argument("sample_id",   help="Sample ID (e.g. 005A)")
+    parser.add_argument("input_path",  help="Path to .bvx/.rsh/.gsh/.npy data file")
+    parser.add_argument("--results-root", default="results", help="Results root directory")
+    parser.add_argument("--force", action="store_true", help="Force recompute")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    cfg   = PipelineConfig({"results_root": args.results_root})
+    agent = LoaderAgent(args.sample_id, config=cfg)
+
+    try:
+        result = agent.run(input_path=args.input_path, force=args.force)
+        print(json.dumps(result, indent=2, default=str))
+        sys.exit(0)
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"REJECT: {e}")
+        sys.exit(2)
+    except Exception as e:
+        logger.exception(f"CRASH: {e}")
+        sys.exit(1)

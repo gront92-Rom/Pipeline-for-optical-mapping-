@@ -11,6 +11,7 @@ Stage map:
     Stage 7:  AlternansAgent       — alternans detection (concordance, Poincaré, FFT)
 
 Agents:
+    loader_agent:        LoaderAgent — data loading, metadata extraction, preprocessing (Stage 1)
     mask_agent:          MaskAgent — tissue mask extraction (Stage 2)
     peak_detector_agent: PeakDetectorAgent — preprocessing + beat detection (Stage 3)
     activation_agent:    ActivationAgent — activation time maps (Stage 4)
