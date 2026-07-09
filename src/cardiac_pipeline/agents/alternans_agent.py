@@ -74,6 +74,9 @@ class AlternansAgent(BaseAgent):
     Генерирует карты амплитуды, фазы, конкордантности и клинический фенотип.
     """
 
+    DEPENDS_ON: list = []  # [APDAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["apd_per_beat_3d.npz", "mask.npy"]
+
     def __init__(
         self,
         sample_id: str,
@@ -119,14 +122,6 @@ class AlternansAgent(BaseAgent):
         self.logger.warning(f"Неизвестный dye='{dye}', используется 'A' (VSD)")
         return "A"
 
-    def _ensure_upstream(self):
-        """Запускает APDAgent если apd_per_beat_3d.npz отсутствует."""
-        npz_path = self.must_dir / "apd_per_beat_3d.npz"
-        if not npz_path.exists():
-            self.logger.info("apd_per_beat_3d.npz не найден — запускаю APDAgent")
-            from cardiac_pipeline.agents.apd_agent import APDAgent
-            APDAgent(self.sample_id, self.config).run()
-
     def _load_apd_3d(self) -> tuple:
         """
         Загружает 3D стек APD из apd_per_beat_3d.npz.
@@ -168,8 +163,10 @@ class AlternansAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Upstream ---
-        self._ensure_upstream()
+        # --- Lazy: запускаем APD (→ PeakDetector → Loader → Mask) ---
+        from cardiac_pipeline.agents.apd_agent import APDAgent
+        self.DEPENDS_ON = [APDAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Метаданные ---
         self._load_metadata()

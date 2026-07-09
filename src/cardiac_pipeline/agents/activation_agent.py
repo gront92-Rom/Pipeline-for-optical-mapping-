@@ -261,6 +261,9 @@ class ActivationAgent(BaseAgent):
     and retries with larger window on WARN.
     """
 
+    DEPENDS_ON: list = []  # [PeakDetectorAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["peaks.npy", "mask.npy"]
+
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
@@ -302,17 +305,6 @@ class ActivationAgent(BaseAgent):
             return float(stim)
         self.logger.warning("stim_hz not found in metadata — using 10.0 Hz")
         return 10.0
-
-    def _ensure_peak_detector(self) -> None:
-        """Run PeakDetectorAgent if its outputs are missing."""
-        needs_run = (
-            not self.exists("peaks.npy") or
-            not self.get_path("preproc_video.npy", kind="debug").exists()
-        )
-        if needs_run:
-            self.logger.info("PeakDetectorAgent outputs missing — running it")
-            from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
-            PeakDetectorAgent(self.sample_id, self.config).run()
 
     def _load_preproc_video(self) -> np.ndarray:
         """Load preproc_video.npy from debug/ (where PeakDetector saves it)."""
@@ -392,14 +384,12 @@ class ActivationAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Ensure upstream ---
-        self._ensure_peak_detector()
+        # --- Lazy: запускаем PeakDetector (→ Loader → Mask) если выходы отсутствуют ---
+        from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
+        self.DEPENDS_ON = [PeakDetectorAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Load metadata ---
-        if not self.exists("metadata.json"):
-            self.logger.info("metadata.json not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
         self._load_metadata()
 
         fps     = self._get_fps()

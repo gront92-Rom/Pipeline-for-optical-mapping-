@@ -49,6 +49,9 @@ N_ROUGH = 7
 
 
 class MaskAgent(BaseAgent):
+    DEPENDS_ON: list = []  # [LoaderAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["raw_video.npy", "metadata.json", "raw_rsm.npy"]
+
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
         # crop параметры живут в config.loader (не в config.mask)
@@ -652,15 +655,13 @@ class MaskAgent(BaseAgent):
             self.logger.info("mask.npy already exists, skipping (use force=True to rerun)")
             return {"status": "skipped"}
 
+        # Lazy: запускаем LoaderAgent если raw_video.npy отсутствует
+        from cardiac_pipeline.agents.loader_agent import LoaderAgent
+        self.DEPENDS_ON = [LoaderAgent]
+        self.ensure_dependencies(force=force)
+
         # _prepare_data должен идти ДО попытки загрузить raw_rsm
-        # (иначе metadata не загружена и LoaderAgent не может быть вызван корректно)
-        try:
-            self._prepare_data()
-        except FileNotFoundError:
-            self.logger.info("raw_video.npy not found — running LoaderAgent first")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
-            self._prepare_data()
+        self._prepare_data()
 
         try:
             raw_rsm = self.load_must("raw_rsm.npy")

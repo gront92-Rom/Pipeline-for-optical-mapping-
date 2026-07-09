@@ -74,6 +74,9 @@ class PeakDetectorAgent(BaseAgent):
       - debug/preproc_video.npy   (heavy intermediate, can be deleted after run)
     """
 
+    DEPENDS_ON: list = []  # [LoaderAgent, MaskAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["mask.npy", "metadata.json"]
+
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
@@ -167,12 +170,13 @@ class PeakDetectorAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Load metadata first (needed for fps/stim_hz) ---
-        # Ensure LoaderAgent ran if metadata missing
-        if not self.exists("metadata.json"):
-            self.logger.info("metadata.json not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
+        # --- Lazy: запускаем Loader + Mask если их выходы отсутствуют ---
+        from cardiac_pipeline.agents.loader_agent import LoaderAgent
+        from cardiac_pipeline.agents.mask_agent import MaskAgent
+        self.DEPENDS_ON = [LoaderAgent, MaskAgent]
+        self.ensure_dependencies(force=force)
+
+        # --- 1. Load metadata ---
         self._load_metadata()
 
         fps     = self._get_fps()

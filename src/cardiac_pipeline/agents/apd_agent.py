@@ -78,6 +78,9 @@ class APDAgent(BaseAgent):
     Генерирует карты APD30/50/80 (или CaT30/50/80) и 3D стек для Stage 7.
     """
 
+    DEPENDS_ON: list = []  # [PeakDetectorAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["peaks.npy", "mask.npy"]
+
     def __init__(
         self,
         sample_id: str,
@@ -88,7 +91,7 @@ class APDAgent(BaseAgent):
         apd_cfg = self.config.apd if isinstance(self.config.apd, dict) else {}
 
         # Параметры из конфига
-        self.min_amplitude:   float = float(apd_cfg.get("min_amplitude",   1.0))
+        self.min_amplitude:   float = float(apd_cfg.get("min_amplitude",   0.001))
         self.qc_min_coverage: float = float(apd_cfg.get("qc_min_coverage", 0.25))
         self.roi_pool_size:   int   = int(apd_cfg.get("roi_pool_size",     3))
         self.apd_min_ms:      float = float(apd_cfg.get("apd_min_ms",      5.0))
@@ -140,13 +143,6 @@ class APDAgent(BaseAgent):
             return "B"
         self.logger.warning(f"Неизвестный dye='{dye}', используется 'A' (VSD)")
         return "A"
-
-    def _ensure_upstream(self):
-        """Запускает PeakDetectorAgent если peaks.npy или mask.npy отсутствуют."""
-        if not self.exists("peaks.npy") or not self.exists("mask.npy"):
-            self.logger.info("peaks.npy или mask.npy не найдены — запускаю PeakDetectorAgent")
-            from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
-            PeakDetectorAgent(self.sample_id, self.config).run()
 
     def _load_preproc_video(self) -> np.ndarray:
         """
@@ -203,14 +199,12 @@ class APDAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Upstream ---
-        self._ensure_upstream()
+        # --- Lazy: запускаем PeakDetector (→ Loader → Mask) если выходы отсутствуют ---
+        from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
+        self.DEPENDS_ON = [PeakDetectorAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Метаданные ---
-        if not self.exists("metadata.json"):
-            self.logger.info("metadata.json not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
         self._load_metadata()
 
         fps = self._get_fps()
