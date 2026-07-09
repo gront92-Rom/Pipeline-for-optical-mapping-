@@ -96,8 +96,18 @@ class BaseAgent(ABC):
     - сохранение результатов
     - загрузку конфигурации (OmegaConf)
     - единый интерфейс run()
-    - lazy-механику (заготовка)
+    - lazy-механику через DEPENDS_ON + REQUIRED_INPUTS
     """
+
+    # === Lazy-механика ===
+    # Классы upstream-агентов, от которых зависит данный агент.
+    # Переопределяется в наследниках.
+    DEPENDS_ON: list[type["BaseAgent"]] = []
+
+    # MUST-файлы, которые должны существовать до запуска данного агента.
+    # Это выходы предыдущих агентов — проверяются через exists().
+    # Переопределяется в наследниках.
+    REQUIRED_INPUTS: list[str] = []
 
     def __init__(self, sample_id: str, config: Optional[Union[PipelineConfig, dict, DictConfig]] = None):
         self.sample_id = sample_id
@@ -159,10 +169,45 @@ class BaseAgent(ABC):
         path = self.get_path(filename, kind)
         return path.exists() or path.with_suffix('.npy').exists()
 
-    def ensure_upstream(self, upstream_class, **kwargs):
-        """Заготовка для lazy-вызова предыдущих агентов."""
-        self.logger.debug(f"ensure_upstream called for {upstream_class.__name__} (not implemented yet)")
-        # Пример реализации будет в конкретных агентах
+    def has_all_required_outputs(self) -> bool:
+        """Проверяет наличие всех REQUIRED_INPUTS (MUST-файлов)."""
+        return all(self.exists(f) for f in self.REQUIRED_INPUTS)
+
+    def get_missing_inputs(self) -> list[str]:
+        """Возвращает список отсутствующих MUST-файлов из REQUIRED_INPUTS."""
+        return [f for f in self.REQUIRED_INPUTS if not self.exists(f)]
+
+    def ensure_dependencies(self, force: bool = False):
+        """
+        Lazy-механика: проверяет и запускает все upstream-агенты,
+        от которых зависит данный агент.
+
+        Логика:
+          1. Проверяет свои REQUIRED_INPUTS.
+          2. Если все есть — skip.
+          3. Если чего-то не хватает — запускает DEPENDS_ON агенты по очереди.
+             Каждый upstream агент рекурсивно запустит свои зависимости.
+          4. После каждого upstream проверяет, не удовлетворены ли входы.
+        """
+        missing = self.get_missing_inputs()
+        if not missing:
+            self.logger.debug(
+                f"[LAZY] {self.__class__.__name__}: все REQUIRED_INPUTS найдены"
+            )
+            return
+
+        self.logger.info(
+            f"[LAZY] {self.__class__.__name__}: отсутствуют {missing} → запуск upstream"
+        )
+        for upstream_class in self.DEPENDS_ON:
+            upstream = upstream_class(self.sample_id, config=self.config)
+            self.logger.info(f"[LAZY] → запуск {upstream_class.__name__}")
+            upstream.run(force=force)
+            # После запуска проверяем, не удовлетворены ли входы
+            still_missing = self.get_missing_inputs()
+            if not still_missing:
+                self.logger.debug(f"[LAZY] входы удовлетворены после {upstream_class.__name__}")
+                break
 
     @abstractmethod
     def run(self, force: bool = False, **kwargs) -> Dict[str, Any]:

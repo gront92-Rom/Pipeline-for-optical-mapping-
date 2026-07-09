@@ -123,6 +123,9 @@ class ConductionAgent(BaseAgent):
     по каждому биту → nanmean / nanstd по битам.
     """
 
+    DEPENDS_ON: list = []  # [ActivationAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["per_beat_activation.npy", "mask.npy"]
+
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
@@ -175,13 +178,6 @@ class ConductionAgent(BaseAgent):
                 "Проверьте metadata.json."
             )
         return px
-
-    def _ensure_activation_agent(self) -> None:
-        """Запускает ActivationAgent если per_beat_activation.npy отсутствует."""
-        if not self.exists("per_beat_activation.npy"):
-            self.logger.info("per_beat_activation.npy missing — running ActivationAgent")
-            from cardiac_pipeline.agents.activation_agent import ActivationAgent
-            ActivationAgent(self.sample_id, self.config).run()
 
     # ==================== CONSENSUS COMPUTATION ====================
 
@@ -322,8 +318,10 @@ class ConductionAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Lazy upstream ---
-        self._ensure_activation_agent()
+        # --- Lazy: запускаем Activation (→ PeakDetector → Loader → Mask) ---
+        from cardiac_pipeline.agents.activation_agent import ActivationAgent
+        self.DEPENDS_ON = [ActivationAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Metadata ---
         self._load_metadata()

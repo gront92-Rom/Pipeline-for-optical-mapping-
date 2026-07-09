@@ -62,6 +62,10 @@ class SidelineAgent(BaseAgent):
     SidelineAgent: Проверяет длину видео, извлекает и фильтрует центральный трейс 
     для длинных файлов (>=4096 кадров), генерирует инструкцию для ручного анализа.
     """
+
+    DEPENDS_ON: list = []  # [LoaderAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["raw_video.npy", "metadata.json"]
+
     def __init__(
         self,
         sample_id: str,
@@ -85,7 +89,12 @@ class SidelineAgent(BaseAgent):
             status: "sideline_isolated" если файл длинный, "pass" если файл обычный.
         """
         self.logger.info("Running SidelineAgent check...")
-        
+
+        # --- Lazy: запускаем Loader если raw_video.npy отсутствует ---
+        from cardiac_pipeline.agents.loader_agent import LoaderAgent
+        self.DEPENDS_ON = [LoaderAgent]
+        self.ensure_dependencies(force=force)
+
         try:
             video = self._load_video()
             metadata = self._load_metadata()

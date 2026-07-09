@@ -6,3 +6,6 @@ results/
 *.egg-info/
 dist/
 build/
+*.md
+!tracking/*.md
+!docs/**/*.md

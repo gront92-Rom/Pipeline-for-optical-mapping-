@@ -1,271 +1,165 @@
-# Module Status — Статус каждого модуля пайплайна
+# Module Status — cardiac_pipeline_v3
 
-**Дата создания:** 2026-07-02  
-**Последнее обновление:** 2026-07-03
+**Последнее обновление:** 2026-07-08  
+**Ветка:** `update-pipeline`  
+**Архитектура:** BaseAgent + PipelineConfig (OmegaConf), `config/default.yaml` — единый конфиг
 
 ---
 
 ## Легенда
 
-| Символ | Значение |
-|--------|----------|
-| ❌ | Не начато / не выполнено |
-| 🔄 | В процессе |
-| ✅ | Завершено |
-| ⚠️ | Частично (указать детали) |
-| 🚫 | Не применимо |
+| ✅ Готов | 🔄 В процессе | ⚠️ Частично | ❌ Не начато | 🚫 N/A |
 
 ---
 
-## 0b. SidelineAgent / `sideline_agent.py`
+## Стадии и агенты
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Готов | Создан 2026-07-03 |
-| **Критические баги** | ✅ Нет | — |
-| **Рефакторинг** | ✅ | Наследует BaseAgent, использует `temporal_lowpass` из `utils.preprocess` |
-| **Тесты** | ❌ | Нужен `test_sideline_smoke.py` с синтетическим видео ≥ 4096 кадров |
-| **Документация** | ✅ | Docstring + `SIDELINE_GUIDE.txt` генерируется автоматически |
-| **Зависимости** | LoaderAgent → SidelineAgent (перед Stage 1) |
-| **Блокеры** | Нет |
+### Stage 0 — SidelineAgent / `sideline_agent.py` (168 строк)
 
-### Логика работы
-- Загружает `video.npy` и `metadata.json` из `must_dir` (артефакты LoaderAgent).
-- Если `video.shape[0] < 4096` — возвращает `{"status": "pass"}`, пайплайн продолжается.
-- Если `video.shape[0] >= 4096` — извлекает центральный трейс 3×3, фильтрует (Butterworth 80 Гц), сохраняет `sideline_trace.npz` и `SIDELINE_GUIDE.txt` в `must_dir`, возвращает `{"status": "sideline_isolated"}`.
-- Оркестратор обязан проверить статус и прервать Stage 1–6 при `sideline_isolated`.
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ❌ (нет test_sideline_smoke.py) |
+| Интеграция в оркестратор | ❌ (нет оркестратора) |
+| Логика | < 4096 кадров → pass; ≥ 4096 → sideline_isolated |
+| Блокеры | Нет |
 
-### Открытые задачи
-- [ ] Написать `test_sideline_smoke.py` (синтетическое видео 5000 кадров)
-- [ ] Добавить параметр `frame_limit` в `config/default.yaml`
-- [ ] Интегрировать вызов в оркестратор `optical_pipeline_worker.py` (создаётся позже)
+### Stage 1 — LoaderAgent / `loader_agent.py` (416 строк)
 
----
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ✅ 23/23 PASS |
+| F42 fix (_find_files_by_stem) | ✅ Исправлен 2026-07-08 |
+| recording_mode из metadata | ✅ Добавлен 2026-07-08 |
+| compute_dominant_freq (FFT) | ✅ Подключён 2026-07-08 |
+| E2E тест на реальном .rsh | ✅ 6.4s, 004A (2048×100×100, fps=1000) |
+| Полярность A/B | ✅ Уже была исправлена (preprocess v6) |
+| Блокеры | Нет |
 
-## 1. LoaderAgent / `stage_load` / `optical_pipeline_worker._resolve_fps`
+### Stage 2 — MaskAgent / `mask_agent.py` (483 строк)
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ⚠️ Sampled | `_resolve_fps` проревьюирован; единственный корректный источник fps |
-| **Критические баги** | ✅ Нет SEV1 | fps-root-cause закрыт в воркере (но не доходит до sub-агентов) |
-| **Рефакторинг** | ❌ | Нужно: вынести в `io_meta.py`, сделать единый загрузчик |
-| **Тесты** | ❌ | — |
-| **Документация** | ⚠️ | Описан в PIPELINE_STRUCTURE.md |
-| **Зависимости** | 🚫 | Первый в цепочке |
-| **Блокеры** | — | Нет |
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ❌ |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен тест |
 
-### Открытые задачи
-- [ ] Вынести `read_fps_from_gsh` в отдельный модуль `io_meta.py` (F1)
-- [ ] Обеспечить передачу fps во все downstream агенты
+### Stage 3 — PeakDetectorAgent / `peak_detector_agent.py` (312 строк)
 
----
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ❌ |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен тест |
 
-## 2. MaskAgent / `rsm_mask_worker_v2/v3` + `auto_mask.py`
+### Stage 4 — ActivationAgent / `activation_agent.py` (516 строк)
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Full diff | v2/v3 diff + auto_mask сигнатуры |
-| **Критические баги** | ⚠️ | MW3 (удаление чужих файлов), AM1 (Найквист) |
-| **Рефакторинг** | ❌ | Нужно: вынести в MaskAgent, убрать crop хардкоды |
-| **Тесты** | ❌ | — |
-| **Документация** | ⚠️ | Changelog v3 фиктивен (MW1) |
-| **Зависимости** | LoaderAgent → MaskAgent |
-| **Блокеры** | — | Нет критических |
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ❌ |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен тест |
 
-### Открытые задачи
-- [ ] Исправить `_cleanup_intermediates` allowlist (F20)
-- [ ] Валидировать `highcut` против Найквиста (F33)
-- [ ] Исправить фиктивный changelog (F23)
-- [ ] Вынести `CROP_LEFT/RIGHT` в конфиг (MW4)
-- [ ] `Path.with_suffix` вместо string replace (F39)
+### Stage 5 — APDAgent / `apd_agent.py` (578 строк)
 
----
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ✅ 29/29 PASS |
+| Демо (run_apd_demo.py) | ✅ Синтетический трейс |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен E2E |
 
-## 3. ActivationAgent / `activation_agent.py`
+### Stage 6 — ConductionAgent / `conduction_agent.py` (442 строк)
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Full | 887 строк, 4 метода целиком |
-| **Критические баги** | ❌ Много SEV1-2 | AG1 (fps), AG2 (exit 0 на TAT), AG3 (bool verdict) |
-| **Рефакторинг** | ❌ | Монолит: compute + matplotlib в одном файле |
-| **Тесты** | ❌ | — |
-| **Документация** | ⚠️ | — |
-| **Зависимости** | LoaderAgent + MaskAgent → ActivationAgent |
-| **Блокеры** | F1 (fps) блокирует корректность |
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ✅ ALL PASS |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен E2E |
 
-### Открытые задачи
-- [ ] Убрать fps дефолт 1000 (F1 / AG1)
-- [ ] Починить `final_verdict` bool→string (F10 / AG3)
-- [ ] Exit 1 на абсурдном TAT (F18 / AG2)
-- [ ] Синхронизировать beat_pass_rate (F13 / AG4)
-- [ ] Полярность A/B из метаданных (F14 / AG6)
-- [ ] Окно анализа в мс (F15 / AG8)
-- [ ] Геометрию из формы маски (F31 / AG7)
-- [ ] Флагировать fallback 50pct (F32 / AG9)
-- [ ] `fft_phase` в choices (F30)
+### Stage 6b — ConductionConsensusAgent / `conduction_consensus_agent.py` (305 строк)
 
----
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ❌ CLI-агент, не BaseAgent |
+| Интеграция | ⚠️ standalone CLI, не часть v3 chain |
+| BUG-1..5 фиксы | ✅ (ImportError, pixel_size, exit codes, NaN) |
+| Блокеры | Нужноrefactor → BaseAgent |
 
-## 4. APDAgent / `apd_agent.py`
+### Stage 7 — AlternansAgent / `alternans_agent.py` (434 строк)
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Full | 543 строки |
-| **Критические баги** | ❌ SEV1 | A1 (dt_ms=1.0), A2 (нет мультибит), A3 (нет A/B) |
-| **Рефакторинг** | ❌ | Дублирует логику с `apd_worker.py` |
-| **Тесты** | ❌ | Нужен test_apd.py (recovery ±5 ms) |
-| **Документация** | ⚠️ | Stage mislabel (A9) |
-| **Зависимости** | ActivationAgent → APDAgent |
-| **Блокеры** | F1 (fps), F6 (A/B ветка) |
+| Аспект | Статус |
+|--------|--------|
+| Наследует BaseAgent | ✅ |
+| run() | ✅ |
+| smoke-тест | ✅ 28/28 PASS |
+| E2E на реальных данных | ❌ |
+| Блокеры | Неизвестно — нужен E2E |
 
-### Открытые задачи
-- [ ] Убрать `dt_ms=1.0` хардкод (F1 / A1)
-- [ ] Добавить A/B ветку и hard-invert (F6 / A3)
-- [ ] Починить `APD_raw` baseline (F17 / A4)
-- [ ] WARN→FAIL для абсурдных APD (F18 / A5)
-- [ ] Починить provenance-ложь (F19 / A6)
-- [ ] Исправить stage mislabel (F38 / A9)
-- [ ] Написать `test_apd.py`
+### Stage 8 — PhenotypeAgent
+
+| Аспект | Статус |
+|--------|--------|
+| Существует | ❌ Не реализован |
+| Блокеры | Зависит от всех upstream |
 
 ---
 
-## 5. ConductionAgent / `conduction_analysis.py` + `source_cv_agent.py`
+## Утилиты
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Full | conduction: 326 строк; source_cv: 960 строк |
-| **Критические баги** | ❌ SEV1 | CV1 (ImportError!), C1 (fps), C2 (NaN→normal), SC1 (нет QC) |
-| **Рефакторинг** | ❌ | Coherence filter — главная проблема (88-94% потеря) |
-| **Тесты** | ❌ | Нужен test_conduction.py (fraction_kept > 60%) |
-| **Документация** | ⚠️ | — |
-| **Зависимости** | ActivationAgent + MaskAgent → ConductionAgent |
-| **Блокеры** | F5 (ImportError) — **критический**, блокирует запуск! |
-
-### Открытые задачи
-- [ ] **СРОЧНО:** Починить ImportError `cv_method_local_fit` (F5)
-- [ ] Убрать `FS_HZ=1000.0` (F1 / C1)
-- [ ] NaN-CV → undetermined, не 'normal' (F3 / C2)
-- [ ] Единый pixel_size_mm (F2 / CV2, CV3, P4)
-- [ ] Добавить judge/QC в source_cv_agent (F3 / SC1)
-- [ ] Унифицировать границы CV (F12)
-- [ ] Добавить provenance (F16 / SC2)
-- [ ] Убрать абсолютный путь (F27 / SC5)
-- [ ] Дедуп ST (F25)
-- [ ] Написать `test_conduction.py`
+| Файл | Строк | Статус | smoke-тест |
+|------|-------|--------|------------|
+| `base_agent.py` | — | ✅ | (в каждом agent-тесте) |
+| `utils/preprocess.py` v6 | — | ✅ | ✅ 23/23 PASS |
+| `utils/signal.py` | — | ✅ | ✅ (в apd_smoke) |
+| `utils/alternans.py` | — | ✅ | ✅ (в alternans_smoke) |
+| `utils/cv_estimators.py` | — | ✅ | ✅ (в cv_smoke) |
+| `utils/metadata_extractor.py` | — | ✅ (F42 fixed) | ✅ (в loader_smoke) |
 
 ---
 
-## 6. AlternansAgent / `alternans_detection.py` + `alternans_worker.py`
+## Оркестратор / Runner
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ✅ Full / Almost full | detection: 490; worker: 652 строки |
-| **Критические баги** | ❌ SEV1 | AL1 (fps), AL2 (2:1→normal), AL3 (NaN→normal), AW1 (нет judge), AW2 (f_dom) |
-| **Рефакторинг** | ❌ | — |
-| **Тесты** | ❌ | Нужен тест на synthetic с known alternans |
-| **Документация** | ⚠️ | — |
-| **Зависимости** | APDAgent → AlternansAgent |
-| **Блокеры** | F1 (fps), F4 (2:1 detection) |
-
-### Открытые задачи
-- [ ] Убрать `FS_HZ=1000.0` (F1 / AL1)
-- [ ] Починить 2:1 → 'normal' (F4 / AL2)
-- [ ] NaN → undetermined (F3 / AL3)
-- [ ] Добавить `judge()` в alternans_worker (F3 / AW1)
-- [ ] Проверять ~0.5 cycles/beat (F4 / AW2)
-- [ ] Починить рассинхрон ключей (F8 / P3)
-- [ ] Добавить provenance (F16 / AW3)
-- [ ] Дедуп dye-detect (F35 / AW4)
-- [ ] Убрать неиспользуемые импорты (F28 / AL5)
+| Аспект | Статус |
+|--------|--------|
+| Существует | ❌ Не реализован |
+| Назначение | Lazy graph: загрузить результаты upstream по demand |
+| Блокеры | Ждёт ConductionConsensus → BaseAgent refactor |
 
 ---
 
-## 7. OWSAgent / `stage_ows` + `stage_phase_df`
+## Smoke-тесты — сводка
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ❌ Не ревьюирован | — |
-| **Критические баги** | ❓ Неизвестно | — |
-| **Рефакторинг** | ❌ | — |
-| **Тесты** | ❌ | — |
-| **Документация** | ❌ | — |
-| **Зависимости** | Activation / APD → OWS |
-| **Блокеры** | Нужен ревью |
-
-### Открытые задачи
-- [ ] Провести полный ревью `stage_ows`
-- [ ] Провести полный ревью `stage_phase_df`
-- [ ] Проверить fps-зависимость
-- [ ] Проверить NaN handling
+| Тест | Тестов | Результат |
+|------|--------|-----------|
+| test_loader_smoke.py | 23 | ✅ 23/23 PASS |
+| test_preprocess_smoke.py | 23 | ✅ 23/23 PASS |
+| test_apd_smoke.py | 29 | ✅ 29/29 PASS |
+| test_cv_smoke.py | ~5 | ✅ ALL PASS |
+| test_alternans_smoke.py | 28 | ✅ 28/28 PASS |
+| test_consensus_agent_cli.py | — | ⚠️ CLI-тест, не pytest |
+| **Итого** | **~108** | **✅ ALL PASS** |
 
 ---
 
-## 8. PhenotypeAgent / `stage_phenotype`
+## Что осталось сделать
 
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ❌ Не ревьюирован | — |
-| **Критические баги** | ⚠️ Известно | NaN → 'normal' по умолчанию (из PIPELINE_STRUCTURE) |
-| **Рефакторинг** | ❌ | — |
-| **Тесты** | ❌ | — |
-| **Документация** | ⚠️ | Упоминается в PIPELINE_STRUCTURE |
-| **Зависимости** | Все предыдущие → PhenotypeAgent |
-| **Блокеры** | Все upstream баги влияют на фенотип |
-
-### Открытые задачи
-- [ ] Провести полный ревью `stage_phenotype`
-- [ ] Исправить NaN → 'normal' (связано с F3)
-- [ ] Проверить агрегацию метрик
-
----
-
-## 9. Оркестратор / `optical_pipeline_worker.py`
-
-| Аспект | Статус | Детали |
-|--------|--------|--------|
-| **Ревью кода** | ⚠️ Sampled | 3066 строк; judge/retry/run_pipeline/stage_load/stage_activation/stage_alternans/stage_apd/__main__ |
-| **Критические баги** | ❌ SEV1 | P1 (judge skip None), P2 (exit 0 quarantined), P3 (ключи), P4 (pixel) |
-| **Рефакторинг** | ❌ | Монолит 3066 строк |
-| **Тесты** | ❌ | — |
-| **Документация** | ⚠️ | RETRY мёртвый вердикт (P8) |
-| **Зависимости** | Вызывает все агенты |
-| **Блокеры** | — |
-
-### Открытые задачи
-- [ ] Починить `judge()` (F7 / P1, P2)
-- [ ] Починить рассинхрон ключей Stage 5 (F8 / P3)
-- [ ] Исправить `pixel_size_mm=0.085` опечатку (F2 / P4)
-- [ ] `soft_fail` exit code (F21 / P11)
-- [ ] `peak_thr_frac` code-floor (F22 / P5)
-- [ ] Окно в мс (F15 / P7)
-- [ ] Sentinel-коллизия stim_hz (F29 / P9)
-- [ ] Дубль-ключ stage_6_ows (F34 / P12)
-- [ ] Документировать RETRY (F36 / P8)
-- [ ] Доревьюировать: stage_mask, stage_cv, stage_ows, stage_phase_df, stage_phenotype
-
----
-
-## 10. Утилиты / Не ревьюированные файлы
-
-| Файл | Статус ревью | Гипотезы |
-|------|-------------|----------|
-| `peak_detector_agent.py` | ❌ | 4-я копия detect_dye? |
-| `qc_thresholds.yaml` | ❌ | Существует ли? judge() его игнорирует? |
-| `stage_mask` (внутри воркера) | ❌ | — |
-| `stage_cv` (внутри воркера) | ❌ | Дублирует CV-логику? fps? |
-| `stage_source_cv` (внутри воркера) | ❌ | — |
-
----
-
-## Сводка готовности к production
-
-| Критерий | Статус |
-|----------|--------|
-| Все SEV1 закрыты | ❌ (15 открытых) |
-| fps корректен во всех агентах | ❌ |
-| Нет тихих 'normal' на NaN | ❌ |
-| Нет ImportError при запуске | ❌ (CV1) |
-| Регресс-тест проходит | ❌ |
-| Единый конфиг параметров | ❌ |
-| Тесты существуют | ❌ |
-| **ГОТОВ К PRODUCTION** | **❌ НЕТ** |
+1. **Оркестратор (runner.py)** — lazy graph, запуск цепочки Stage 0→8
+2. **ConductionConsensusAgent → BaseAgent** — refactor из CLI в v3-агента
+3. **PhenotypeAgent** — Stage 8, агрегация метрик
+4. **E2E тесты** — MaskAgent, PeakDetector, Activation на реальных .rsh
+5. **test_sideline_smoke.py** — синтетическое видео ≥ 4096 кадров
+6. **OWS / Phase** — не реализовано в v3 (было в старом воркере)

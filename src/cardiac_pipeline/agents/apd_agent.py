@@ -78,6 +78,9 @@ class APDAgent(BaseAgent):
     Генерирует карты APD30/50/80 (или CaT30/50/80) и 3D стек для Stage 7.
     """
 
+    DEPENDS_ON: list = []  # [PeakDetectorAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["peaks.npy", "mask.npy"]
+
     def __init__(
         self,
         sample_id: str,
@@ -88,7 +91,7 @@ class APDAgent(BaseAgent):
         apd_cfg = self.config.apd if isinstance(self.config.apd, dict) else {}
 
         # Параметры из конфига
-        self.min_amplitude:   float = float(apd_cfg.get("min_amplitude",   1.0))
+        self.min_amplitude:   float = float(apd_cfg.get("min_amplitude",   0.001))
         self.qc_min_coverage: float = float(apd_cfg.get("qc_min_coverage", 0.25))
         self.roi_pool_size:   int   = int(apd_cfg.get("roi_pool_size",     3))
         self.apd_min_ms:      float = float(apd_cfg.get("apd_min_ms",      5.0))
@@ -141,39 +144,42 @@ class APDAgent(BaseAgent):
         self.logger.warning(f"Неизвестный dye='{dye}', используется 'A' (VSD)")
         return "A"
 
-    def _ensure_upstream(self):
-        """Запускает PeakDetectorAgent если peaks.npy или mask.npy отсутствуют."""
-        if not self.exists("peaks.npy") or not self.exists("mask.npy"):
-            self.logger.info("peaks.npy или mask.npy не найдены — запускаю PeakDetectorAgent")
-            from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
-            PeakDetectorAgent(self.sample_id, self.config).run()
-
     def _load_preproc_video(self) -> np.ndarray:
         """
         Загружает препроцессированное видео для APD (150 Гц LPF).
 
+        Variant A (2026-07-09): LoaderAgent is the sole producer of both:
+          1. must/preproc_video_apd.npy  — 150 Гц LPF (для APD-ветки)
+          2. must/preproc_video.npy      —  80 Гц LPF (для PeakDetector/Activation/Alternans)
+
         Приоритет:
-          1. debug/preproc_video_apd.npy  — специально препроцессированное для APD
-          2. debug/preproc_video.npy      — стандартное от PeakDetectorAgent (80 Гц)
-             В этом случае выдаёт WARNING: для APD рекомендуется 150 Гц LPF.
+          1. must/preproc_video_apd.npy  — специально препроцессированное для APD
+          2. must/preproc_video.npy      — стандартное (80 Гц LPF, fallback)
         """
-        apd_path = self.get_path("preproc_video_apd.npy", kind="debug")
+        apd_path = self.get_path("preproc_video_apd.npy", kind="must")
         if apd_path.exists():
-            self.logger.info(f"Загружаю preproc_video_apd.npy (150 Гц LPF)")
+            self.logger.info(f"Загружаю must/preproc_video_apd.npy (150 Гц LPF)")
             return np.load(apd_path)
 
-        std_path = self.get_path("preproc_video.npy", kind="debug")
+        std_path = self.get_path("preproc_video.npy", kind="must")
         if std_path.exists():
             self.logger.warning(
-                "preproc_video_apd.npy не найден — использую preproc_video.npy (80 Гц LPF). "
-                "Для точного APD рекомендуется запустить preprocess_video(..., target_stage='apd') "
-                "и сохранить результат как debug/preproc_video_apd.npy."
+                "preproc_video_apd.npy не найден — использую must/preproc_video.npy (80 Гц LPF). "
+                "Variant A: LoaderAgent должен сохранять preproc_video_apd.npy отдельно."
             )
             return np.load(std_path)
 
+        # Backward-compat: legacy debug/ locations
+        legacy_apd = self.get_path("preproc_video_apd.npy", kind="debug")
+        if legacy_apd.exists():
+            return np.load(legacy_apd)
+        legacy_std = self.get_path("preproc_video.npy", kind="debug")
+        if legacy_std.exists():
+            return np.load(legacy_std)
+
         raise FileNotFoundError(
-            f"Не найдено ни preproc_video_apd.npy, ни preproc_video.npy в {self.debug_dir}. "
-            "Запустите PeakDetectorAgent."
+            f"Не найдено ни preproc_video_apd.npy, ни preproc_video.npy в must/ или debug/. "
+            f"Запустите LoaderAgent (Variant A)."
         )
 
     # ------------------------------------------------------------------
@@ -203,14 +209,12 @@ class APDAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Upstream ---
-        self._ensure_upstream()
+        # --- Lazy: запускаем PeakDetector (→ Loader → Mask) если выходы отсутствуют ---
+        from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
+        self.DEPENDS_ON = [PeakDetectorAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Метаданные ---
-        if not self.exists("metadata.json"):
-            self.logger.info("metadata.json not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
         self._load_metadata()
 
         fps = self._get_fps()

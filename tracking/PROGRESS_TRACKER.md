@@ -1,144 +1,112 @@
-# Pipeline Progress Tracker — Cardiac Optical Mapping
+# Progress Tracker — cardiac_pipeline_v3
 
-**Дата создания:** 2026-07-02  
-**Последнее обновление:** 2026-07-02  
-**Статус:** Активный трекинг
-
----
-
-## Обзор системы трекинга
-
-Этот документ является **центральным хабом** для отслеживания прогресса ревью и рефакторинга пайплайна оптического картирования сердца. Он объединяет все находки из 4 сессий ревью и предоставляет единую точку входа для понимания текущего состояния.
-
-### Навигация по документам
-
-| Документ | Расположение | Назначение |
-|----------|-------------|------------|
-| Pipeline Structure | `docs/architecture/PIPELINE_STRUCTURE.md` | Полная структура пайплайна + предлагаемые агенты |
-| Organization Proposal | `docs/architecture/Pipeline_Organization_Proposal.md` | Архитектурное предложение новой структуры |
-| Review Guide | `docs/review/REVIEW_GUIDE.md` | Гайд по систематическому ревью + чек-листы |
-| Master Review | `docs/review/PIPELINE_MASTER_REVIEW.md` | Сводный документ всех находок (4 сессии) |
-| Session 4 Review | `docs/review/PIPELINE_REVIEW_session4.md` | Детальный ревью session 4 |
-| **Fix Tracker** | `tracking/FIX_TRACKER.md` | Детальный трекер каждого фикса |
-| **Module Status** | `tracking/MODULE_STATUS.md` | Статус каждого модуля/агента |
-| **Review Log** | `tracking/REVIEW_LOG.md` | Append-only лог сессий |
+**Последнее обновление:** 2026-07-08  
+**Ветка:** `update-pipeline`  
+**Коммитов:** 5 (последний: `4e06568` — SidelineAgent)
 
 ---
 
-## Сводка прогресса
+## Сводка
 
-### Общий статус по приоритетам
+| Категория | Всего | Готово | В процессе | Осталось |
+|-----------|-------|--------|------------|----------|
+| Агенты (Stage 0-7) | 8 | 7 | 0 | 1 (PhenotypeAgent) |
+| Утилиты | 5 | 5 | 0 | 0 |
+| Smoke-тесты | 6 | 6 ✅ | 0 | 0 |
+| E2E тесты (реальные .rsh) | 8 | 1 (Loader) | 0 | 7 |
+| Оркестратор | 1 | 0 | 0 | 1 |
+| **Итого** | **28** | **19** | **0** | **9** |
 
-| Приоритет | Описание | Всего задач | Выполнено | В работе | Осталось | Прогресс |
-|-----------|----------|-------------|-----------|----------|----------|----------|
-| **P0** | Корректность / безопасность (SEV1) | 9 | 0 | 0 | 9 | ░░░░░░░░░░ 0% |
-| **P1** | Воспроизводимость (SEV2) | 14 | 0 | 0 | 14 | ░░░░░░░░░░ 0% |
-| **P2** | Организация (SEV3) | 13 | 0 | 0 | 13 | ░░░░░░░░░░ 0% |
-| **P3** | Косметика (SEV4) | 5 | 0 | 0 | 5 | ░░░░░░░░░░ 0% |
-| **TOTAL** | — | **41** | **0** | **0** | **41** | ░░░░░░░░░░ 0% |
-
-### Статус по системным паттернам (Root Causes)
-
-| ID | Паттерн | Затронуто файлов | Закрыто | Статус |
-|----|---------|-----------------|---------|--------|
-| R1 | Дрейф калибровки (FPS + PIXEL) | 7 | 0/7 | ❌ Открыт |
-| R2 | Тихий проход неправды (Silent pass) | 6 | 0/6 | ❌ Открыт |
-| R3 | Дублирование с дрейфом | 5 | 0/5 | ❌ Открыт |
-| R4 | Монолит / устаревший контракт | 4 | 0/4 | ❌ Открыт |
-| R5 | Дрейф контракта имён метрик | 2 | 0/2 | ❌ Открыт |
-
-### Ключевые метрики
-
-| Метрика | Текущее | Цель P0 | Цель P1 | Цель финал |
-|---------|---------|---------|---------|------------|
-| Файлов с fps-дефолтом 1000 | 5 | 0 | 0 | 0 |
-| SEV1 открытых | ~15 | 0 | 0 | 0 |
-| Агентов с exit 0 на NaN/FAIL | 5 | 0 | 0 | 0 |
-| Копий dye-detect | 3 | 3 | 1 | 1 |
-| `cv_method_local_fit` ImportError | ДА | НЕТ | НЕТ | НЕТ |
-| SHAM 002A → 'normal' | ДА | НЕТ | НЕТ | НЕТ |
-| Тестов (pytest) | 0 | 2+ | 5+ | 10+ |
-| Покрытие конфигом (%) | ~20% | 60% | 90% | 100% |
+Прогресс: ██████████░░░░░░░░░░ 68%
 
 ---
 
-## Статус по модулям (краткий)
+## Что сделано
 
-| Модуль | Стадия | Ревью | Рефакторинг | Тесты | Блокеры |
-|--------|--------|-------|-------------|-------|---------|
-| `loader_agent` / `stage_load` | Stage 1 | ✅ Sampled | ❌ Не начат | ❌ | — |
-| `rsm_mask_worker v2/v3` | Stage 1-2 | ✅ Full diff | ❌ Не начат | ❌ | MW1-MW5 |
-| `auto_mask.py` | Mask builder | ✅ Sampled | ❌ Не начат | ❌ | AM1 (Найквист) |
-| `activation_agent.py` | Stage 3-4 | ✅ Full | ❌ Не начат | ❌ | AG1, AG2, AG3 |
-| `apd_agent.py` | Stage 4 | ✅ Full | ❌ Не начат | ❌ | A1-A3 (fps, invert) |
-| `conduction_analysis.py` | Библиотека CV | ✅ Full | ❌ Не начат | ❌ | C1, C2 |
-| `source_cv_agent.py` | CV standalone | ✅ Full | ❌ Не начат | ❌ | CV1 (ImportError!) |
-| `alternans_detection.py` | Stage 5 | ✅ Full | ❌ Не начат | ❌ | AL1-AL3 |
-| `alternans_worker.py` | Stage 5 | ✅ Almost full | ❌ Не начат | ❌ | AW1, AW2 |
-| `optical_pipeline_worker.py` | Оркестратор | ⚠️ Sampled | ❌ Не начат | ❌ | P1-P4 |
-| `stage_mask` | Mask (воркер) | ❌ Не ревьюирован | ❌ | ❌ | — |
-| `stage_cv` | CV (воркер) | ❌ Не ревьюирован | ❌ | ❌ | — |
-| `stage_ows` | OWS | ❌ Не ревьюирован | ❌ | ❌ | — |
-| `stage_phase_df` | Phase | ❌ Не ревьюирован | ❌ | ❌ | — |
-| `stage_phenotype` | Phenotype | ❌ Не ревьюирован | ❌ | ❌ | — |
-| `peak_detector_agent.py` | Utility | ❌ Не ревьюирован | ❌ | ❌ | — |
+### 2026-07-02 — Базовая архитектура
+- BaseAgent + PipelineConfig (OmegaConf)
+- config/default.yaml — единый конфиг
+- 5 утилит: preprocess v6, signal, alternans, cv_estimators, metadata_extractor
+- 8 агентов (Stage 0-7), все наследуют BaseAgent (кроме ConsensusAgent)
+- 6 smoke-тестов (108 тестов, все PASS)
+- Ветка `update-pipeline` запушена на GitHub
+
+### 2026-07-08 — LoaderAgent fixes
+- **F42 fix**: `_find_files_by_stem()` переписана — 3-уровневая стратегия match (sample-id → soft substring → empty). Monkey-patch больше не нужен.
+- **recording_mode**: берётся из metadata (header .rsh), fallback из dye
+- **compute_dominant_freq()**: FFT → stim_hz_effective, записывается в metadata.json
+- **E2E тест**: 004A bsl-6Hz — 6.4s, (2048, 100, 100), fps=1000, dye=A, mode=voltage ✅
 
 ---
 
-## Рекомендуемый порядок работы
+## Что осталось
 
-### Фаза 1: P0 фиксы (критическая корректность)
+### Приоритет 1 — Оркестратор
+- `runner.py` — lazy graph оркестратор
+- Загрузка результатов upstream по demand (не обязательный последовательный запуск)
+- Проверка статусов (pass / sideline_isolated / fail)
+- Exit codes: 0=SUCCESS, 1=crash, 2=REJECT/QC
 
-Порядок исполнения оптимизирован по зависимостям:
+### Приоритет 2 — ConductionConsensusAgent → BaseAgent
+- Сейчас CLI-агент (305 строк), не наследует BaseAgent
+- Нужно: refactor в v3-стандарт (run() → dict, save_must/load_must)
 
-1. **F1** — Единый загрузчик fps из `.gsh` → разблокирует все ms-расчёты
-2. **F7** — Починить `judge()` воркера → разблокирует QC
-3. **F5** — Починить ImportError `cv_method_local_fit` → разблокирует CV
-4. **F8** — Зафиксировать схему ключей Stage 5 → разблокирует агрегацию
-5. **F3 + F4** — NaN→undetermined + code-floor порога
-6. **F2** — Единый pixel_size_mm
-7. **F6** — A/B ветка в `apd_agent`
+### Приоритет 3 — E2E тесты на реальных данных
+- MaskAgent + PeakDetector + Activation на 004A (уже загружен)
+- Цепочка: Stage 2→3→4 на одном реальном sample
+- Проверить inter-stage контракт (must/ files)
 
-### Фаза 2: Skeleton новой архитектуры
+### Приоритет 4 — PhenotypeAgent (Stage 8)
+- Агрегация метрик всех стадий → фенотип
+- NaN → 'undetermined' (не 'normal'!)
 
-1. Создать `BaseAgent` с общими методами
-2. Реализовать `PipelineConfig` (Pydantic + YAML)
-3. Создать `CardiacPipeline` runner
-4. Перенести утилиты в `utils/`
+### Приоритет 5 — Sideline smoke test
+- Синтетическое видео 5000 кадров → sideline_isolated
+- Синтетическое видео 2000 кадров → pass
 
-### Фаза 3: P1 фиксы (воспроизводимость)
-
-После P0 — все ms-числа станут корректными. Тогда:
-- Синхронизировать пороги (F10–F23)
-- Добавить provenance хэши (F16)
-- Перевести окна в мс (F15)
-
-### Фаза 4: P2 фиксы (дедупликация)
-
-- Дедуп карты активации (F24)
-- Дедуп структурного тензора (F25)
-- Дедуп детектора биений (F26)
-- Дедуп dye-detect (F35)
-
-### Фаза 5: Тесты + Synthetic data
-
-- `synthetic.py` — генератор синтетических данных
-- `test_conduction.py` — coherence edge cases
-- `test_apd.py` — recovery APD ±5 ms
-- Регресс-тест SHAM 5-08 002A
+### Не реализовано в v3
+- OWS (Optical Wave Similarity) — было в старом `optical_pipeline_worker.py`
+- Phase analysis — было в старом воркере
+- Эти стадии могут быть добавлены позже как отдельные агенты
 
 ---
 
-## Как обновлять этот трекер
+## Архитектура
 
-1. **При завершении фикса:** Обновить статус в `FIX_TRACKER.md`, затем пересчитать сводку здесь.
-2. **При новой сессии ревью:** Добавить запись в `REVIEW_LOG.md`.
-3. **При обнаружении нового бага:** Добавить в `FIX_TRACKER.md` с новым ID.
-4. **Формат прогресс-бара:**
-   - `░░░░░░░░░░` = 0%
-   - `█████░░░░░` = 50%
-   - `██████████` = 100%
+```
+cardiac_pipeline_v3/
+├── config/default.yaml          # единый конфиг (OmegaConf)
+├── src/cardiac_pipeline/
+│   ├── base_agent.py            # BaseAgent + PipelineConfig
+│   ├── agents/
+│   │   ├── sideline_agent.py    # Stage 0: long-file isolation
+│   │   ├── loader_agent.py      # Stage 1: load .rsh → video.npy
+│   │   ├── mask_agent.py        # Stage 2: tissue mask
+│   │   ├── peak_detector_agent.py  # Stage 3: beat detection
+│   │   ├── activation_agent.py  # Stage 4: activation maps (TAT)
+│   │   ├── apd_agent.py         # Stage 5: APD30/50/80
+│   │   ├── conduction_agent.py  # Stage 6: CVL/CVT
+│   │   ├── conduction_consensus_agent.py  # Stage 6b: CLI (не BaseAgent)
+│   │   └── alternans_agent.py   # Stage 7: alternans detection
+│   └── utils/
+│       ├── preprocess.py        # v6: polarity, ASLS, filters
+│       ├── signal.py            # APD detection
+│       ├── alternans.py         # alternans math
+│       ├── cv_estimators.py     # CV methods
+│       └── metadata_extractor.py  # .rsh/.gsh parsing
+├── test_*.py                    # 6 smoke-тестов (108 tests, ALL PASS)
+├── run_apd_demo.py              # APD демо на синтетике
+├── tracking/                    # этот файл + MODULE_STATUS.md
+└── docs/                        # архитектурные docs (частично архив)
+```
 
 ---
 
-*Этот файл обновляется после каждой рабочей сессии.*
+## Git
+
+| Ветка | Последний коммит | Описание |
+|-------|-----------------|----------|
+| `update-pipeline` (active) | `4e06568` | SidelineAgent |
+| `main` | — | Базовая версия |
+
+Uncommitted: `loader_agent.py` + `metadata_extractor.py` (F42 fix + recording_mode + dominant_freq)

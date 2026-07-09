@@ -261,6 +261,9 @@ class ActivationAgent(BaseAgent):
     and retries with larger window on WARN.
     """
 
+    DEPENDS_ON: list = []  # [PeakDetectorAgent] — установлен ниже (lazy import)
+    REQUIRED_INPUTS: list = ["peaks.npy", "mask.npy"]
+
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
@@ -303,26 +306,27 @@ class ActivationAgent(BaseAgent):
         self.logger.warning("stim_hz not found in metadata — using 10.0 Hz")
         return 10.0
 
-    def _ensure_peak_detector(self) -> None:
-        """Run PeakDetectorAgent if its outputs are missing."""
-        needs_run = (
-            not self.exists("peaks.npy") or
-            not self.get_path("preproc_video.npy", kind="debug").exists()
-        )
-        if needs_run:
-            self.logger.info("PeakDetectorAgent outputs missing — running it")
-            from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
-            PeakDetectorAgent(self.sample_id, self.config).run()
-
     def _load_preproc_video(self) -> np.ndarray:
-        """Load preproc_video.npy from debug/ (where PeakDetector saves it)."""
-        path = self.get_path("preproc_video.npy", kind="debug")
-        if not path.exists():
-            raise FileNotFoundError(
-                f"preproc_video.npy not found at {path}. "
-                "PeakDetectorAgent should have produced it."
+        """Load preproc_video.npy from must/ (where LoaderAgent saves it under Variant A).
+
+        Variant A contract (2026-07-09):
+          - LoaderAgent is the SOLE producer of preproc_video.npy → must/preproc_video.npy
+          - ActivationAgent (and PeakDetector/APD/Alternans) is a CONSUMER.
+        """
+        path = self.get_path("preproc_video.npy", kind="must")
+        if path.exists():
+            return np.load(path)
+        # Backward-compat: legacy debug/ location (PeakDetector pre-Variant A runs)
+        legacy = self.get_path("preproc_video.npy", kind="debug")
+        if legacy.exists():
+            self.logger.warning(
+                f"preproc_video.npy найден в debug/ (legacy). Переместите в must/ для Variant A."
             )
-        return np.load(path)
+            return np.load(legacy)
+        raise FileNotFoundError(
+            f"preproc_video.npy не найден ни в must/ ни в debug/. "
+            f"LoaderAgent должен быть запущен первым (Variant A)."
+        )
 
     # ==================== ACTIVATION CALCULATION ====================
 
@@ -392,14 +396,12 @@ class ActivationAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 1. Ensure upstream ---
-        self._ensure_peak_detector()
+        # --- Lazy: запускаем PeakDetector (→ Loader → Mask) если выходы отсутствуют ---
+        from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
+        self.DEPENDS_ON = [PeakDetectorAgent]
+        self.ensure_dependencies(force=force)
 
         # --- 2. Load metadata ---
-        if not self.exists("metadata.json"):
-            self.logger.info("metadata.json not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
         self._load_metadata()
 
         fps     = self._get_fps()

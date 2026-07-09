@@ -76,6 +76,9 @@ class LoaderAgent(BaseAgent):
     Производит: raw_video.npy, preproc_video.npy, preproc_video_apd.npy, metadata.json.
     """
 
+    DEPENDS_ON: list = []           # Stage 1 — ни от кого не зависит
+    REQUIRED_INPUTS: list = []       # вход — внешний файл (input_path)
+
     def __init__(
         self,
         sample_id: str,
@@ -209,6 +212,121 @@ class LoaderAgent(BaseAgent):
         }
 
     # ------------------------------------------------------------------
+    # Auto-discovery входного файла
+    # ------------------------------------------------------------------
+
+    # Расширения файлов данных, которые LoaderAgent умеет загружать
+    DATA_EXTENSIONS = (".rsh", ".bvx", ".npy")
+
+    def _discover_input_file(self) -> Path:
+        """
+        Автоматический поиск входного файла для sample_id.
+        
+        Порядок поиска:
+          1. results_root/<sample_id>/raw/  (*.rsh, *.bvx, *.npy)
+          2. data_root/<sample_id>/        (*.rsh, *.bvx, *.npy)
+          3. data_root/                    (любой файл с sample_id в имени)
+        
+        Возвращает Path к найденному файлу.
+        Raise ValueError если ничего не найдено.
+        """
+        sample = self.sample_id
+        data_root = Path(self.config.data_root)
+        results_root = Path(self.config.results_root)
+        
+        # 1. results_root/<sample>/raw/
+        raw_dir = results_root / sample / "raw"
+        if raw_dir.exists():
+            for ext in self.DATA_EXTENSIONS:
+                candidates = sorted(raw_dir.glob(f"*{ext}"))
+                if candidates:
+                    self.logger.info(f"Auto-discovery: {candidates[0]} (from {raw_dir})")
+                    return candidates[0]
+        
+        # 2. data_root/<sample>/
+        sample_dir = data_root / sample
+        if sample_dir.exists():
+            for ext in self.DATA_EXTENSIONS:
+                candidates = sorted(sample_dir.glob(f"*{ext}"))
+                if candidates:
+                    self.logger.info(f"Auto-discovery: {candidates[0]} (from {sample_dir})")
+                    return candidates[0]
+        
+        # 3. data_root/ — ищем файл с sample_id в имени
+        if data_root.exists():
+            for ext in self.DATA_EXTENSIONS:
+                # Точное совпадение по sample_id в имени файла
+                pattern = f"*{sample}*{ext}"
+                candidates = sorted(data_root.rglob(pattern))
+                if candidates:
+                    # Фильтруем: sample_id как отдельный токен (не подстрока другого ID)
+                    # Например, "004A" не должен матчить "004AB"
+                    filtered = [
+                        c for c in candidates
+                        if self._sample_id_matches(c.stem, sample)
+                    ]
+                    if filtered:
+                        self.logger.info(f"Auto-discovery: {filtered[0]} (from data_root rglob)")
+                        return filtered[0]
+        
+        raise ValueError(
+            f"Auto-discovery: файл для sample '{sample}' не найден. "
+            f"Искал в:\n"
+            f"  1. {raw_dir}/  (*.rsh, *.bvx, *.npy)\n"
+            f"  2. {sample_dir}/  (*.rsh, *.bvx, *.npy)\n"
+            f"  3. {data_root}/  (rglob '*{sample}*')\n"
+            f"Передайте input_path явно в run()."
+        )
+    
+    @staticmethod
+    def _sample_id_matches(stem: str, sample_id: str) -> bool:
+        """
+        Проверяет, что sample_id присутствует в имени файла как отдельный токен.
+        '004A' матчит '2026-05-08-mSHAM-bs2-6Hz-0508-004A', но не '004AB'.
+        """
+        # Разбиваем по разделителям и проверяем точное совпадение
+        import re
+        tokens = re.split(r'[-_.\s]+', stem.upper())
+        return sample_id.upper() in tokens
+
+    # Companion-расширения MiCAM ULTIMA
+    COMPANION_EXTENSIONS = (".rsh", ".gsh", ".rsm", ".gsd", ".rsd", ".bvx")
+
+    def _discover_companion_files(self, input_path: Path) -> dict:
+        """
+        Находит все companion-файлы MiCAM ULTIMA рядом с input_path.
+        
+        Возвращает dict: {".rsh": "/path/to/file.rsh", ".gsh": "...", ...}
+        Использует stem (имя без расширения) для поиска.
+        """
+        stem = input_path.stem
+        parent = input_path.parent
+        
+        companions = {}
+        for ext in self.COMPANION_EXTENSIONS:
+            # Точное совпадение по stem
+            candidate = parent / (stem + ext)
+            if candidate.exists():
+                companions[ext] = str(candidate)
+                continue
+            # Без скобок-суффиксов (например, "(0)" в .rsd)
+            if ext == ".rsd":
+                rsd_candidates = sorted(parent.glob(f"{stem}*{ext}"))
+                if rsd_candidates:
+                    companions[ext] = [str(c) for c in rsd_candidates]
+        
+        # Гарантируем: .rsh всегда есть (это основной файл)
+        if input_path.suffix == ".rsh":
+            companions[".rsh"] = str(input_path)
+        elif ".rsh" not in companions:
+            # Если input — .bvx/.npy, ищем .rsh с тем же stem
+            rsh_candidate = parent / (stem + ".rsh")
+            if rsh_candidate.exists():
+                companions[".rsh"] = str(rsh_candidate)
+        
+        return companions
+
+    # ------------------------------------------------------------------
     # Главный метод
     # ------------------------------------------------------------------
 
@@ -244,18 +362,9 @@ class LoaderAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- 2. Разрешение пути ---
+        # --- 2. Разрешение пути (auto-discovery) ---
         if input_path is None:
-            # Ищем в стандартном месте: results_root/<sample_id>/raw/
-            raw_dir = Path(self.config.results_root) / self.sample_id / "raw"
-            candidates = list(raw_dir.glob("*.bvx")) + list(raw_dir.glob("*.npy"))
-            if not candidates:
-                raise ValueError(
-                    f"input_path не указан и файлы не найдены в {raw_dir}. "
-                    "Передайте input_path явно в run()."
-                )
-            input_path = candidates[0]
-            self.logger.info(f"Автообнаружение файла: {input_path}")
+            input_path = self._discover_input_file()
 
         input_path = Path(input_path)
         if not input_path.exists():
@@ -267,6 +376,7 @@ class LoaderAgent(BaseAgent):
 
         fps = metadata.get("fps")
         dye = metadata.get("dye")
+        recording_mode = metadata.get("recording_mode")
 
         if fps is None:
             raise ValueError(
@@ -275,15 +385,67 @@ class LoaderAgent(BaseAgent):
             )
         fps = float(fps)
 
+        # Если recording_mode не извлечён из header — выводим из dye
+        if recording_mode is None and dye is not None:
+            d = dye.upper().strip()
+            if d.startswith("A"):
+                recording_mode = "voltage"
+            elif d.startswith("B"):
+                recording_mode = "calcium"
+        metadata["recording_mode"] = recording_mode
+
         # --- 4. Загрузка видео + кроп ---
         self.logger.info(f"Загружаю видео: {input_path.name}")
         video = self._load_video(input_path)
         video = self._crop_video(video)
         T, H, W = video.shape
-        self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}")
+        self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}, mode={recording_mode}")
+
+        # --- 4b. Доминантная частота сигнала (FFT) ---
+        try:
+            from cardiac_pipeline.utils.metadata_extractor import compute_dominant_freq
+            stim_hz_effective = compute_dominant_freq(video, fps=fps)
+            metadata["stim_hz_effective"] = round(stim_hz_effective, 2)
+            self.logger.info(f"Доминантная частота сигнала: {stim_hz_effective:.2f} Hz")
+        except Exception as e:
+            self.logger.warning(f"compute_dominant_freq failed: {e}")
+            metadata["stim_hz_effective"] = None
+
+        # --- 4b.2. Сохранение путей ко всем companion-файлам в metadata ---
+        companion_files = self._discover_companion_files(input_path)
+        metadata["companion_files"] = companion_files
+        self.logger.info(f"Companion files: {list(companion_files.keys())}")
+
+        # Сохраняем обновлённые метаданные
+        self.save_must(metadata, "metadata.json")
 
         # --- 5. Сохранение сырого видео ---
         self.save_must(video, "raw_video.npy")
+
+        # --- 5b. Загрузка .rsm (background frame) для MaskAgent PRIMARY ---
+        rsm_path = input_path.with_suffix(".rsm")
+        if not rsm_path.exists():
+            # Try alternate: replace .rsh with .rsm in the same directory
+            rsm_path = input_path.parent / (input_path.stem + ".rsm")
+        if rsm_path.exists():
+            try:
+                rsm_raw = np.fromfile(str(rsm_path), dtype=np.uint16)
+                orig_W = 128  # MiCAM ULTIMA sensor width (before crop)
+                expected = H * orig_W
+                if rsm_raw.size >= expected:
+                    rsm_frame = rsm_raw[:expected].reshape(H, orig_W)
+                    # Apply same crop as video
+                    if self.crop_left + self.crop_right > 0:
+                        rsm_frame = rsm_frame[:, self.crop_left:orig_W - self.crop_right]
+                    rsm_3d = rsm_frame[np.newaxis, :, :].astype(np.float32)  # (1, H, W_crop)
+                    self.save_must(rsm_3d, "raw_rsm.npy")
+                    self.logger.info(f"raw_rsm.npy сохранён: {rsm_3d.shape} из {rsm_path.name}")
+                else:
+                    self.logger.warning(f"rsm size {rsm_raw.size} < expected {expected} — пропускаю")
+            except Exception as e:
+                self.logger.warning(f"Не удалось загрузить .rsm ({e}) — MaskAgent будет использовать fallback")
+        else:
+            self.logger.info(f".rsm не найден рядом с {input_path.name} — MaskAgent будет использовать fallback")
 
         # --- 6. Sideline-гейтинг ---
         if T >= self.sideline_threshold:
@@ -293,8 +455,10 @@ class LoaderAgent(BaseAgent):
             self._log_metrics({"loader_mode": "sideline", "n_frames": T, "elapsed_s": elapsed})
             return result
 
-        # --- 7. Предобработка activation (80 Гц) ---
-        self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц)...")
+        # --- 7. Предобработка activation (80 Гц) → must/preproc_video.npy ---
+        # Variant A (2026-07-09): preproc_video.npy — MUST (не debug).
+        # Single source of truth для PeakDetector/Activation/APD/Alternans.
+        self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц) → must/preproc_video.npy")
         preproc_act = preprocess_video(
             video=video,
             fps=fps,
@@ -304,14 +468,17 @@ class LoaderAgent(BaseAgent):
             sigma=self.spatial_sigma,
             chunk_size=self.chunk_size,
             overlap=self.overlap,
+            sample_name=self.sample_id,             # ← FIX: явный sample_name для should_invert()
             dye=dye,
+            recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,          # ASLS требует маску — откладываем до MaskAgent
             do_normalize=True,
         )
-        self.save_debug(preproc_act, "preproc_video.npy")
+        self.save_must(preproc_act, "preproc_video.npy")
 
-        # --- 8. Предобработка APD (150 Гц) ---
-        self.logger.info(f"Предобработка APD (LPF={self.lp_cutoff_apd} Гц)...")
+        # --- 8. Предобработка APD (150 Гц) → must/preproc_video_apd.npy ---
+        # Variant A: тоже MUST (используется APDAgent — отдельная ветка с более мягким LPF)
+        self.logger.info(f"Предобработка APD (LPF={self.lp_cutoff_apd} Гц) → must/preproc_video_apd.npy")
         preproc_apd = preprocess_video(
             video=video,
             fps=fps,
@@ -321,11 +488,13 @@ class LoaderAgent(BaseAgent):
             sigma=self.spatial_sigma,
             chunk_size=self.chunk_size,
             overlap=self.overlap,
+            sample_name=self.sample_id,             # ← FIX: явный sample_name для should_invert()
             dye=dye,
+            recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,
             do_normalize=True,
         )
-        self.save_debug(preproc_apd, "preproc_video_apd.npy")
+        self.save_must(preproc_apd, "preproc_video_apd.npy")
 
         # --- 9. Метрики ---
         elapsed = round(time.perf_counter() - t0, 2)
@@ -336,12 +505,16 @@ class LoaderAgent(BaseAgent):
             "width":         W,
             "fps":           fps,
             "dye":           dye,
+            "recording_mode": recording_mode,
+            "stim_hz":       metadata.get("stim_hz"),
+            "stim_hz_effective": metadata.get("stim_hz_effective"),
             "elapsed_s":     elapsed,
         })
 
         self.logger.info(
             f"LoaderAgent done in {elapsed}s — "
-            f"video={video.shape}, fps={fps}, dye={dye}"
+            f"video={video.shape}, fps={fps}, dye={dye}, mode={recording_mode}, "
+            f"stim_hz_eff={metadata.get('stim_hz_effective')}"
         )
 
         return {
