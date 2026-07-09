@@ -455,8 +455,10 @@ class LoaderAgent(BaseAgent):
             self._log_metrics({"loader_mode": "sideline", "n_frames": T, "elapsed_s": elapsed})
             return result
 
-        # --- 7. Предобработка activation (80 Гц) ---
-        self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц)...")
+        # --- 7. Предобработка activation (80 Гц) → must/preproc_video.npy ---
+        # Variant A (2026-07-09): preproc_video.npy — MUST (не debug).
+        # Single source of truth для PeakDetector/Activation/APD/Alternans.
+        self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц) → must/preproc_video.npy")
         preproc_act = preprocess_video(
             video=video,
             fps=fps,
@@ -472,10 +474,11 @@ class LoaderAgent(BaseAgent):
             do_asls=False,          # ASLS требует маску — откладываем до MaskAgent
             do_normalize=True,
         )
-        self.save_debug(preproc_act, "preproc_video.npy")
+        self.save_must(preproc_act, "preproc_video.npy")
 
-        # --- 8. Предобработка APD (150 Гц) ---
-        self.logger.info(f"Предобработка APD (LPF={self.lp_cutoff_apd} Гц)...")
+        # --- 8. Предобработка APD (150 Гц) → must/preproc_video_apd.npy ---
+        # Variant A: тоже MUST (используется APDAgent — отдельная ветка с более мягким LPF)
+        self.logger.info(f"Предобработка APD (LPF={self.lp_cutoff_apd} Гц) → must/preproc_video_apd.npy")
         preproc_apd = preprocess_video(
             video=video,
             fps=fps,
@@ -491,7 +494,7 @@ class LoaderAgent(BaseAgent):
             do_asls=False,
             do_normalize=True,
         )
-        self.save_debug(preproc_apd, "preproc_video_apd.npy")
+        self.save_must(preproc_apd, "preproc_video_apd.npy")
 
         # --- 9. Метрики ---
         elapsed = round(time.perf_counter() - t0, 2)

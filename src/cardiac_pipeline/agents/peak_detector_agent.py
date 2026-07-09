@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
 """
-PeakDetectorAgent — Stage: Preprocessing + Beat Detection
+PeakDetectorAgent — Stage 2.5: Beat Detection
 
-Single source of truth for:
-  - Spatial + temporal preprocessing (smooth + Butterworth LP)
-  - Dye-aware signal inversion (VSD A vs Calcium B)
-  - Robust beat/peak detection
+CONTRACT (v3 ARCHITECTURE, 2026-07-09 — VARIANT A):
+  - Preprocessing (LPF, inversion, spatial smooth) is the SOLE responsibility of LoaderAgent.
+  - PeakDetectorAgent is a CONSUMER: reads preproc_video.npy from must/, never recomputes.
+  - Single source of truth: one preprocess, downstream stages read the same signal.
 
-Produces:
-  - MUST:  peaks.npy                  — frame indices of beats
-  - MUST:  peak_detection_meta.json   — fps, stim_hz, n_peaks, params
-  - DEBUG: mean_trace.npy             — mean masked signal (for validation)
-  - DEBUG: preproc_stats.json         — min/max/mean/std of preproc_video
-  - INTERMEDIATE (debug/): preproc_video.npy — smoothed, filtered, inverted
+Inputs (lazy):
+  - must/preproc_video.npy   (from LoaderAgent — 80 Hz LPF, inverted, ready for detection)
+  - must/mask.npy            (from MaskAgent)
+  - must/metadata.json       (from LoaderAgent — fps, dye, recording_mode, stim_hz)
+
+Outputs:
+  - must/peaks.npy                  — frame indices of beats
+  - must/peak_detection_meta.json   — fps, stim_hz, n_peaks, params
+  - debug/mean_trace.npy            — smoothed mean tissue trace
+  - debug/preproc_stats.json        — min/max/mean/std of preproc_video (for QA)
 
 Architecture:
   - Inherits from BaseAgent (must/debug contracts, sample_id paths, OmegaConf)
-  - Lazy-calls LoaderAgent + MaskAgent if needed
-  - Config-driven via config.peak_detector section
+  - Lazy-calls LoaderAgent + MaskAgent via ensure_dependencies
+  - Config-driven via config.peak_detector section (only detection params, not preprocess)
 
 Исправления при интеграции (2026-07-02):
   - Удалён собственный BaseAgent-стаб → cardiac_pipeline.base_agent
@@ -30,6 +34,15 @@ Architecture:
   - print() → self.logger
   - peak_detector секция добавлена в config/default.yaml
   - stim_hz читается из metadata.json (не только из config)
+
+Рефакторинг 2026-07-09 (VARIANT A — Loader owns preprocessing):
+  - Удалён вызов preprocess_video() — PeakDetector больше НЕ фильтрует/инвертирует данные
+  - Удалён импорт preprocess_video, should_invert
+  - Прямой контракт: must/preproc_video.npy должен существовать (иначе ValueError)
+  - DEPENDS_ON = [LoaderAgent, MaskAgent] — lazy-цепочка даёт preproc_video.npy
+  - REQUIRED_INPUTS обновлён: ["preproc_video.npy", "mask.npy", "metadata.json"]
+  - Удалён self.sigma, self.lp_cutoff, self.chunk_size (больше не нужны агенту)
+  - Оставлены только detection params: prominence_frac, sigma_temporal, min_peaks
 """
 
 import json
@@ -42,14 +55,6 @@ import numpy as np
 from cardiac_pipeline.base_agent import BaseAgent, PipelineConfig
 
 try:
-    from cardiac_pipeline.utils.preprocess import preprocess_video, should_invert
-    PREPROCESS_AVAILABLE = True
-except ImportError:
-    preprocess_video = None
-    should_invert = None
-    PREPROCESS_AVAILABLE = False
-
-try:
     from cardiac_pipeline.utils.peak_detection import detect_beats
     PEAK_DETECTION_AVAILABLE = True
 except ImportError:
@@ -59,36 +64,35 @@ except ImportError:
 
 class PeakDetectorAgent(BaseAgent):
     """
-    PeakDetectorAgent — unified preprocessing + beat detection stage.
+    PeakDetectorAgent — beat detection stage (v3 Variant A).
 
-    Inputs (lazy):
-      - must/raw_video.npy  (from LoaderAgent)
-      - must/mask.npy          (from MaskAgent)
-      - must/metadata.json     (from LoaderAgent)
+    CONSUMER contract: reads preproc_video.npy from must/, never recomputes preprocessing.
+    LoaderAgent is the single source of truth for spatial/temporal filtering + inversion.
+
+    Inputs (lazy via DEPENDS_ON = [LoaderAgent, MaskAgent]):
+      - must/preproc_video.npy   (from LoaderAgent — 80 Hz LPF + inversion)
+      - must/mask.npy            (from MaskAgent)
+      - must/metadata.json       (from LoaderAgent — fps, dye, recording_mode, stim_hz)
 
     Outputs:
       - must/peaks.npy
       - must/peak_detection_meta.json
       - debug/mean_trace.npy
       - debug/preproc_stats.json
-      - debug/preproc_video.npy   (heavy intermediate, can be deleted after run)
     """
 
     DEPENDS_ON: list = []  # [LoaderAgent, MaskAgent] — установлен ниже (lazy import)
-    REQUIRED_INPUTS: list = ["mask.npy", "metadata.json"]
+    REQUIRED_INPUTS: list = ["preproc_video.npy", "mask.npy", "metadata.json"]
 
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
-        # Config section: config.peak_detector (falls back to config.preprocess)
+        # Detection params only (preprocessing is LoaderAgent's job)
         pd_cfg = getattr(self.config, 'peak_detector', {}) or {}
-        pre_cfg = getattr(self.config, 'preprocess', {}) or {}
 
-        self.sigma          = float(pd_cfg.get('spatial_sigma',   pre_cfg.get('spatial_sigma',   2.0)))
-        self.lp_cutoff      = float(pd_cfg.get('lp_cutoff_hz',    pre_cfg.get('temporal_cutoff_hz', 80.0)))
         self.prominence_frac = float(pd_cfg.get('prominence_frac', 0.3))
-        self.chunk_size     = int(pd_cfg.get('chunk_size',         pre_cfg.get('chunk_size',      8192)))
-        self.min_peaks      = int(pd_cfg.get('min_peaks',          3))
+        self.sigma_temporal = float(pd_cfg.get('sigma_temporal', 3.0))
+        self.min_peaks      = int(pd_cfg.get('min_peaks',        3))
 
         self.metadata: Dict[str, Any] = {}
 
@@ -143,25 +147,32 @@ class PeakDetectorAgent(BaseAgent):
             MaskAgent(self.sample_id, self.config).run()
         return self.load_must("mask.npy").astype(bool)
 
-    def _load_video(self) -> np.ndarray:
-        """Load raw_video.npy, run LoaderAgent if missing."""
-        if not self.exists("raw_video.npy"):
-            self.logger.info("raw_video.npy not found — running LoaderAgent")
-            from cardiac_pipeline.agents.loader_agent import LoaderAgent
-            LoaderAgent(self.sample_id, self.config).run()
-        return self.load_must("raw_video.npy")
+    def _load_preproc_video(self) -> np.ndarray:
+        """Load preproc_video.npy from must/ (created by LoaderAgent).
+
+        Variant A contract: PeakDetector is a CONSUMER, not a producer, of preprocessed data.
+        If the file is missing, raise immediately — do NOT recompute preprocessing.
+        """
+        if not self.exists("preproc_video.npy"):
+            raise FileNotFoundError(
+                f"must/preproc_video.npy не найден для {self.sample_id}. "
+                f"LoaderAgent должен быть запущен первым (Variant A: Loader owns preprocessing). "
+                f"Запустите LoaderAgent явно: python -m cardiac_pipeline.agents.loader_agent {self.sample_id}"
+            )
+        return self.load_must("preproc_video.npy")
 
     # ==================== RUN ====================
 
     def run(self, force: bool = False, **kwargs) -> Dict[str, Any]:
         """
-        Main entry point.
+        Main entry point (Variant A — Consumer contract).
 
         1. Skip if peaks.npy exists and force=False
-        2. Load metadata, video, mask (lazy upstream)
-        3. Preprocess (spatial + temporal filter + inversion)
+        2. Lazy: ensure preproc_video.npy + mask.npy + metadata.json exist
+           (runs LoaderAgent + MaskAgent if missing)
+        3. Read preproc_video.npy (NO recomputation)
         4. Detect beats
-        5. Gate: raise if n_peaks < min_peaks (AG2 fix)
+        5. Gate: raise if n_peaks < min_peaks
         6. Save artifacts
         """
         if not force and self.exists("peaks.npy"):
@@ -170,7 +181,11 @@ class PeakDetectorAgent(BaseAgent):
 
         t0 = time.perf_counter()
 
-        # --- Lazy: запускаем Loader + Mask если их выходы отсутствуют ---
+        # --- Lazy: ensure Loader + Mask produced all REQUIRED_INPUTS ---
+        # NOTE (Variant A, 2026-07-09): ensure_dependencies auto-runs upstream agents
+        # if REQUIRED_INPUTS are missing. This is a CONVENIENCE for dev workflows.
+        # In production, run LoaderAgent explicitly first to lock in preprocessing params
+        # (no silent Loader re-run with default stim_hz=NaN).
         from cardiac_pipeline.agents.loader_agent import LoaderAgent
         from cardiac_pipeline.agents.mask_agent import MaskAgent
         self.DEPENDS_ON = [LoaderAgent, MaskAgent]
@@ -181,76 +196,47 @@ class PeakDetectorAgent(BaseAgent):
 
         fps     = self._get_fps()
         stim_hz = self._get_stim_hz()
-        self.logger.info(f"FPS={fps}, stim_hz={stim_hz}")
+        invert  = bool(self.metadata.get("recording_mode", "").lower() in
+                       ("voltage", "vsd", "ap") or
+                       str(self.metadata.get("dye", "")).upper().startswith("A"))
+        self.logger.info(f"FPS={fps}, stim_hz={stim_hz}, inverted={invert}")
 
-        # --- 2. Load inputs ---
-        raw_video = self._load_video()
-        mask      = self._load_mask()
-        self.logger.info(f"Video shape: {raw_video.shape}, mask coverage: {mask.mean():.3f}")
+        # --- 2. Load preprocessed video (Variant A: no recompute) ---
+        preproc_video = self._load_preproc_video()
+        mask          = self._load_mask()
+        self.logger.info(f"Preproc video shape: {preproc_video.shape}, "
+                         f"mask coverage: {mask.mean():.3f}, "
+                         f"range=[{preproc_video.min():.1f}, {preproc_video.max():.1f}]")
 
-        # --- 3. Preprocessing ---
-        if not PREPROCESS_AVAILABLE:
-            raise ImportError(
-                "cardiac_pipeline.utils.preprocess not available. "
-                "Cannot run PeakDetectorAgent."
-            )
-
-        self.logger.info(
-            f"Preprocessing: sigma={self.sigma}, lp_cutoff={self.lp_cutoff} Hz, "
-            f"chunk_size={self.chunk_size}"
-        )
-
-        invert = should_invert(
-            sample_name=self.sample_id,
-            dye=self.metadata.get("dye"),
-            recording_mode=self.metadata.get("recording_mode"),
-        )
-        self.logger.info(f"Inversion: {invert}")
-
-        preproc_video = preprocess_video(
-            raw_video,
-            mask=mask,
-            fps=fps,
-            sigma=self.sigma,
-            lp_cutoff=self.lp_cutoff,
-            chunk_size=self.chunk_size,
-            invert=invert,
-            sample_name=self.sample_id,
-            dye=self.metadata.get("dye"),
-            recording_mode=self.metadata.get("recording_mode"),
-            do_normalize=False,
-        )
-
-        # Save preprocessed video as debug intermediate (heavy, can be deleted)
-        self.save_debug(preproc_video, "preproc_video.npy")
-        self.logger.info("Saved debug/preproc_video.npy")
-
-        # --- 4. Beat detection ---
+        # --- 3. Beat detection ---
         if not PEAK_DETECTION_AVAILABLE:
             raise ImportError(
                 "cardiac_pipeline.utils.peak_detection not available. "
                 "Cannot detect beats."
             )
 
-        self.logger.info(f"Detecting beats (stim_hz={stim_hz}, prominence_frac={self.prominence_frac})")
+        self.logger.info(f"Detecting beats (stim_hz={stim_hz}, "
+                         f"prominence_frac={self.prominence_frac}, "
+                         f"sigma_temporal={self.sigma_temporal})")
         peaks, mean_trace = detect_beats(
             preproc_video,
             mask,
             fps=fps,
             stim_hz=stim_hz,
             prominence_frac=self.prominence_frac,
+            sigma_temporal=self.sigma_temporal,
         )
         n_peaks = int(len(peaks))
         self.logger.info(f"Detected {n_peaks} peaks: {peaks.tolist()}")
 
-        # --- 5. Gating (AG2 fix: no silent pass) ---
+        # --- 4. Gating (AG2 fix: no silent pass) ---
         if n_peaks < self.min_peaks:
             raise ValueError(
                 f"Слишком мало пиков: {n_peaks} (требуется минимум {self.min_peaks}). "
                 f"Sample {self.sample_id} требует ручной проверки."
             )
 
-        # --- 6. Save artifacts ---
+        # --- 5. Save artifacts ---
         self.save_must(peaks, "peaks.npy")
 
         peak_meta = {
@@ -259,9 +245,9 @@ class PeakDetectorAgent(BaseAgent):
             "stim_hz":          stim_hz,
             "n_peaks":          n_peaks,
             "prominence_frac":  self.prominence_frac,
-            "spatial_sigma":    self.sigma,
-            "lp_cutoff_hz":     self.lp_cutoff,
-            "inverted":         bool(invert),
+            "sigma_temporal":   self.sigma_temporal,
+            "inverted":         invert,
+            "preprocessing_owner": "LoaderAgent",   # Variant A marker
         }
         self.save_must(peak_meta, "peak_detection_meta.json")
 
@@ -290,12 +276,17 @@ class PeakDetectorAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 # Standalone CLI (development / debugging)
 # ---------------------------------------------------------------------------
+# NOTE (Variant A, 2026-07-09): PeakDetector CLI expects preproc_video.npy from LoaderAgent.
+# Run LoaderAgent first:
+#   python -m cardiac_pipeline.agents.loader_agent <sample_id>
+#   python -m cardiac_pipeline.agents.mask_agent    <sample_id>
+#   python -m cardiac_pipeline.agents.peak_detector_agent <sample_id>
 
 if __name__ == "__main__":
     import argparse
     from omegaconf import OmegaConf
 
-    parser = argparse.ArgumentParser(description="PeakDetectorAgent standalone")
+    parser = argparse.ArgumentParser(description="PeakDetectorAgent standalone (Variant A: consumer)")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
     parser.add_argument("--results-root", default="results")
     args = parser.parse_args()
@@ -303,10 +294,8 @@ if __name__ == "__main__":
     cfg = PipelineConfig({
         "results_root": args.results_root,
         "peak_detector": {
-            "spatial_sigma":   2.0,
-            "lp_cutoff_hz":    80.0,
             "prominence_frac": 0.3,
-            "chunk_size":      8192,
+            "sigma_temporal":  3.0,
             "min_peaks":       3,
         },
     })

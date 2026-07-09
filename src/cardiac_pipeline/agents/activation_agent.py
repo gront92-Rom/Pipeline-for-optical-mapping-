@@ -307,14 +307,26 @@ class ActivationAgent(BaseAgent):
         return 10.0
 
     def _load_preproc_video(self) -> np.ndarray:
-        """Load preproc_video.npy from debug/ (where PeakDetector saves it)."""
-        path = self.get_path("preproc_video.npy", kind="debug")
-        if not path.exists():
-            raise FileNotFoundError(
-                f"preproc_video.npy not found at {path}. "
-                "PeakDetectorAgent should have produced it."
+        """Load preproc_video.npy from must/ (where LoaderAgent saves it under Variant A).
+
+        Variant A contract (2026-07-09):
+          - LoaderAgent is the SOLE producer of preproc_video.npy → must/preproc_video.npy
+          - ActivationAgent (and PeakDetector/APD/Alternans) is a CONSUMER.
+        """
+        path = self.get_path("preproc_video.npy", kind="must")
+        if path.exists():
+            return np.load(path)
+        # Backward-compat: legacy debug/ location (PeakDetector pre-Variant A runs)
+        legacy = self.get_path("preproc_video.npy", kind="debug")
+        if legacy.exists():
+            self.logger.warning(
+                f"preproc_video.npy найден в debug/ (legacy). Переместите в must/ для Variant A."
             )
-        return np.load(path)
+            return np.load(legacy)
+        raise FileNotFoundError(
+            f"preproc_video.npy не найден ни в must/ ни в debug/. "
+            f"LoaderAgent должен быть запущен первым (Variant A)."
+        )
 
     # ==================== ACTIVATION CALCULATION ====================
 

@@ -148,28 +148,38 @@ class APDAgent(BaseAgent):
         """
         Загружает препроцессированное видео для APD (150 Гц LPF).
 
+        Variant A (2026-07-09): LoaderAgent is the sole producer of both:
+          1. must/preproc_video_apd.npy  — 150 Гц LPF (для APD-ветки)
+          2. must/preproc_video.npy      —  80 Гц LPF (для PeakDetector/Activation/Alternans)
+
         Приоритет:
-          1. debug/preproc_video_apd.npy  — специально препроцессированное для APD
-          2. debug/preproc_video.npy      — стандартное от PeakDetectorAgent (80 Гц)
-             В этом случае выдаёт WARNING: для APD рекомендуется 150 Гц LPF.
+          1. must/preproc_video_apd.npy  — специально препроцессированное для APD
+          2. must/preproc_video.npy      — стандартное (80 Гц LPF, fallback)
         """
-        apd_path = self.get_path("preproc_video_apd.npy", kind="debug")
+        apd_path = self.get_path("preproc_video_apd.npy", kind="must")
         if apd_path.exists():
-            self.logger.info(f"Загружаю preproc_video_apd.npy (150 Гц LPF)")
+            self.logger.info(f"Загружаю must/preproc_video_apd.npy (150 Гц LPF)")
             return np.load(apd_path)
 
-        std_path = self.get_path("preproc_video.npy", kind="debug")
+        std_path = self.get_path("preproc_video.npy", kind="must")
         if std_path.exists():
             self.logger.warning(
-                "preproc_video_apd.npy не найден — использую preproc_video.npy (80 Гц LPF). "
-                "Для точного APD рекомендуется запустить preprocess_video(..., target_stage='apd') "
-                "и сохранить результат как debug/preproc_video_apd.npy."
+                "preproc_video_apd.npy не найден — использую must/preproc_video.npy (80 Гц LPF). "
+                "Variant A: LoaderAgent должен сохранять preproc_video_apd.npy отдельно."
             )
             return np.load(std_path)
 
+        # Backward-compat: legacy debug/ locations
+        legacy_apd = self.get_path("preproc_video_apd.npy", kind="debug")
+        if legacy_apd.exists():
+            return np.load(legacy_apd)
+        legacy_std = self.get_path("preproc_video.npy", kind="debug")
+        if legacy_std.exists():
+            return np.load(legacy_std)
+
         raise FileNotFoundError(
-            f"Не найдено ни preproc_video_apd.npy, ни preproc_video.npy в {self.debug_dir}. "
-            "Запустите PeakDetectorAgent."
+            f"Не найдено ни preproc_video_apd.npy, ни preproc_video.npy в must/ или debug/. "
+            f"Запустите LoaderAgent (Variant A)."
         )
 
     # ------------------------------------------------------------------
