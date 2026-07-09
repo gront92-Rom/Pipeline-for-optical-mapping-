@@ -458,6 +458,12 @@ class LoaderAgent(BaseAgent):
         # --- 7. Предобработка activation (80 Гц) → must/preproc_video.npy ---
         # Variant A (2026-07-09): preproc_video.npy — MUST (не debug).
         # Single source of truth для PeakDetector/Activation/APD/Alternans.
+        #
+        # BUGFIX 2026-07-09: do_normalize=True ВЫКЛЮЧЕН. Loader НЕ имеет mask на этом этапе,
+        # normalize_traces работает per-pixel и для VSD/инвертированного сигнала baseline
+        # q=10 захватывает минимумы (= пики AP) → после нормализации AP становятся
+        # отрицательными дефлексиями → trace визуально перевёрнут.
+        # ΔF/F нормализация — задача APDAgent (у него есть mask).
         self.logger.info(f"Предобработка activation (LPF={self.lp_cutoff_act} Гц) → must/preproc_video.npy")
         preproc_act = preprocess_video(
             video=video,
@@ -472,7 +478,7 @@ class LoaderAgent(BaseAgent):
             dye=dye,
             recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,          # ASLS требует маску — откладываем до MaskAgent
-            do_normalize=True,
+            do_normalize=False,     # BUGFIX: перцентильная нормализация без mask портит VSD
         )
         self.save_must(preproc_act, "preproc_video.npy")
 
@@ -492,7 +498,7 @@ class LoaderAgent(BaseAgent):
             dye=dye,
             recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,
-            do_normalize=True,
+            do_normalize=False,     # BUGFIX: APDAgent сделает свою ΔF/F с mask
         )
         self.save_must(preproc_apd, "preproc_video_apd.npy")
 
