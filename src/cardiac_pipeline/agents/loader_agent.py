@@ -267,6 +267,7 @@ class LoaderAgent(BaseAgent):
 
         fps = metadata.get("fps")
         dye = metadata.get("dye")
+        recording_mode = metadata.get("recording_mode")
 
         if fps is None:
             raise ValueError(
@@ -275,12 +276,34 @@ class LoaderAgent(BaseAgent):
             )
         fps = float(fps)
 
+        # Если recording_mode не извлечён из header — выводим из dye
+        if recording_mode is None and dye is not None:
+            d = dye.upper().strip()
+            if d.startswith("A"):
+                recording_mode = "voltage"
+            elif d.startswith("B"):
+                recording_mode = "calcium"
+        metadata["recording_mode"] = recording_mode
+
         # --- 4. Загрузка видео + кроп ---
         self.logger.info(f"Загружаю видео: {input_path.name}")
         video = self._load_video(input_path)
         video = self._crop_video(video)
         T, H, W = video.shape
-        self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}")
+        self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}, mode={recording_mode}")
+
+        # --- 4b. Доминантная частота сигнала (FFT) ---
+        try:
+            from cardiac_pipeline.utils.metadata_extractor import compute_dominant_freq
+            stim_hz_effective = compute_dominant_freq(video, fps=fps)
+            metadata["stim_hz_effective"] = round(stim_hz_effective, 2)
+            self.logger.info(f"Доминантная частота сигнала: {stim_hz_effective:.2f} Hz")
+        except Exception as e:
+            self.logger.warning(f"compute_dominant_freq failed: {e}")
+            metadata["stim_hz_effective"] = None
+
+        # Сохраняем обновлённые метаданные
+        self.save_must(metadata, "metadata.json")
 
         # --- 5. Сохранение сырого видео ---
         self.save_must(video, "raw_video.npy")
@@ -304,7 +327,9 @@ class LoaderAgent(BaseAgent):
             sigma=self.spatial_sigma,
             chunk_size=self.chunk_size,
             overlap=self.overlap,
+            sample_name=self.sample_id,             # ← FIX: явный sample_name для should_invert()
             dye=dye,
+            recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,          # ASLS требует маску — откладываем до MaskAgent
             do_normalize=True,
         )
@@ -321,7 +346,9 @@ class LoaderAgent(BaseAgent):
             sigma=self.spatial_sigma,
             chunk_size=self.chunk_size,
             overlap=self.overlap,
+            sample_name=self.sample_id,             # ← FIX: явный sample_name для should_invert()
             dye=dye,
+            recording_mode=recording_mode,           # ← из metadata, не из dye
             do_asls=False,
             do_normalize=True,
         )
@@ -336,12 +363,16 @@ class LoaderAgent(BaseAgent):
             "width":         W,
             "fps":           fps,
             "dye":           dye,
+            "recording_mode": recording_mode,
+            "stim_hz":       metadata.get("stim_hz"),
+            "stim_hz_effective": metadata.get("stim_hz_effective"),
             "elapsed_s":     elapsed,
         })
 
         self.logger.info(
             f"LoaderAgent done in {elapsed}s — "
-            f"video={video.shape}, fps={fps}, dye={dye}"
+            f"video={video.shape}, fps={fps}, dye={dye}, mode={recording_mode}, "
+            f"stim_hz_eff={metadata.get('stim_hz_effective')}"
         )
 
         return {

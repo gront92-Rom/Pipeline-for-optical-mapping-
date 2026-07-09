@@ -7,7 +7,12 @@ metadata_extractor.py — Read-only metadata extractor for MiCAM optical files.
     2. .rsh (MiCAM ULTIMA v1505+) — fps, n_frames, dims, stim, camera
     3. .gsh (MiCAM05 fallback) — fps, n_frames, dims, date
 
-Дополнительно парсит filename для: sample_id, dye (A/B), stim_hz.
+Дополнительно парсит filename для: sample_id, dye (A/B), stim_hz,
+protocol (baseline/iso/stretch/bleb/...), timepoint, model (TAC/SHAM/WT),
+drug (iso/bleb/nola/ach/carb), tissue (SAN/LAA/RAA).
+
+compute_dominant_freq() — определяет основную частоту из сигнала (FFT),
+надёжнее чем stim_hz из имени для спонтанной/нерегулярной активности.
 
 Сохраняет metadata.json и возвращает dict.
 """
@@ -18,6 +23,8 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # =============================================================================
 # Filename parsing
@@ -66,6 +73,168 @@ def parse_stim_hz_from_filename(filename: str) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+# =============================================================================
+# Protocol / condition parsing from filename
+# =============================================================================
+_PROTOCOL_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("arrhythmia",     re.compile(r'arrh(?:yth|y)', re.I)),
+    ("pace_and_stop",  re.compile(r'pace\s+and\s+stop|[-_]st[-_]', re.I)),
+    ("baseline",       re.compile(r'bsl(?:ine|2|3|[-_]\d)?|bs2|bs3|baseline\d?|BSL|BSL2', re.I)),
+    ("bleb",           re.compile(r'bleb(?:bistatin)?', re.I)),
+    ("iso",            re.compile(r'(?<![a-zA-Z])iso(?:50|100)?(?![a-zA-Z])|(?<![a-zA-Z])ISO\d*(?![a-zA-Z])', re.I)),
+    ("stretch",        re.compile(r'stretch', re.I)),
+    ("test",           re.compile(r'(?:^|[-_])tes(?:t)?(?:[-_]|$)', re.I)),
+]
+
+_MODEL_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("mTACc",   re.compile(r'mTACc', re.I)),
+    ("TAC",     re.compile(r'(?<!m)TAC(?!c)', re.I)),
+    ("mSHAM",   re.compile(r'mSHAM', re.I)),
+    ("SHAM",    re.compile(r'(?<!m)SHAM', re.I)),
+    ("WT",      re.compile(r'(?<![a-z])WT(?![a-z])', re.I)),
+]
+
+_DRUG_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("iso",           re.compile(r'(?<![a-zA-Z])iso(?:50|100)?(?![a-zA-Z])|(?<![a-zA-Z])ISO\d*(?![a-zA-Z])', re.I)),
+    ("blebbistatin",  re.compile(r'bleb(?:bistatin)?', re.I)),
+    ("nola",          re.compile(r'(?<![a-zA-Z])nola(?![a-zA-Z])', re.I)),
+    ("acetylcholine", re.compile(r'(?<![a-zA-Z])ach(?![a-zA-Z])', re.I)),
+    ("carbachol",     re.compile(r'carb(?:ochol)?', re.I)),
+    ("high_calcium",  re.compile(r'(?<![a-zA-Z])ca(?:50)?(?![a-zA-Z])', re.I)),
+]
+
+_TISSUE_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("SAN",  re.compile(r'(?<![a-zA-Z])SAN(?![a-zA-Z])')),
+    ("LAA",  re.compile(r'(?<![a-zA-Z])LAA(?![a-zA-Z])')),
+    ("RAA",  re.compile(r'(?<![a-zA-Z])RAA(?![a-zA-Z])')),
+]
+
+_TIMEPOINT_RE = re.compile(
+    r'bsl[-_]?(?:2_)?(\d)|bs(\d)|baseline(\d)|bsl[-_](\d)', re.I
+)
+
+
+def parse_protocol_from_filename(filename: str) -> Optional[str]:
+    """Extract protocol: baseline, iso, stretch, bleb, calcium, arrhythmia, etc."""
+    # Pre-split concatenated tokens like 'isoCa' so 'iso' is found
+    pre = re.sub(r'(iso(?:50|100)?)([Cc][Aa])', r'\1-\2', filename)
+    for proto, pat in _PROTOCOL_PATTERNS:
+        if pat.search(pre):
+            return proto
+    return None
+
+
+def parse_timepoint_from_filename(filename: str) -> Optional[int]:
+    """Extract timepoint (1,2,3...) from patterns like bsl-2, bs2, baseline2."""
+    m = _TIMEPOINT_RE.search(filename)
+    if m:
+        for g in m.groups():
+            if g is not None:
+                try:
+                    return int(g)
+                except ValueError:
+                    pass
+    return None
+
+
+def parse_model_from_filename(filename: str) -> Optional[str]:
+    """Extract animal model: TAC, mTACc, SHAM, mSHAM, WT."""
+    for model, pat in _MODEL_PATTERNS:
+        if pat.search(filename):
+            return model
+    return None
+
+
+def parse_drug_from_filename(filename: str) -> Optional[str]:
+    """Extract drug: iso, blebbistatin, nola, acetylcholine, carbachol.
+
+    Returns the first match. For multiple drugs, use parse_drugs_from_filename.
+    """
+    for drug, pat in _DRUG_PATTERNS:
+        if pat.search(filename):
+            return drug
+    return None
+
+
+def parse_drugs_from_filename(filename: str) -> List[str]:
+    """Extract ALL drugs mentioned in filename.
+
+    Handles concatenated tokens like 'isoCa' (iso + high_calcium)
+    by splitting on known drug boundaries before searching.
+    """
+    # Pre-split concatenated drug tokens: isoCa → iso-Ca, isoCA → iso-CA, etc.
+    # Insert separator between 'iso' and 'Ca' when concatenated
+    pre = re.sub(r'(iso(?:50|100)?)([Cc][Aa])', r'\1-\2', filename)
+    # Also split 'Iso' followed by 'Ca' in any case combination
+    pre = re.sub(r'(ISO(?:50|100)?)(CA)', r'\1-\2', pre, flags=re.I)
+    found: List[str] = []
+    for drug, pat in _DRUG_PATTERNS:
+        if pat.search(pre):
+            found.append(drug)
+    return found
+
+
+def parse_tissue_from_filename(filename: str) -> Optional[str]:
+    """Extract tissue: SAN, LAA, RAA."""
+    for tissue, pat in _TISSUE_PATTERNS:
+        if pat.search(filename):
+            return tissue
+    return None
+
+
+def compute_dominant_freq(video: np.ndarray, fps: float, mask: Optional[np.ndarray] = None) -> Optional[float]:
+    """Compute dominant frequency (Hz) from the actual optical signal.
+
+    Uses FFT on the mean trace across valid pixels. More reliable than
+    filename-derived stim_hz for spontaneous or irregular rhythms.
+
+    Parameters
+    ----------
+    video : np.ndarray (T, H, W) or (T, N)
+        Raw or loaded optical video.
+    fps : float
+        Sampling rate in Hz.
+    mask : np.ndarray (H, W), optional
+        Boolean mask of valid tissue pixels. If None, uses all pixels.
+
+    Returns
+    -------
+    float or None
+        Dominant frequency in Hz, or None if cannot be determined.
+    """
+    if video is None or fps is None or fps <= 0:
+        return None
+    T = video.shape[0]
+    if T < 8:
+        return None
+    # Compute mean trace
+    if video.ndim == 3 and mask is not None:
+        trace = video[:, mask].mean(axis=1)
+    elif video.ndim == 3:
+        trace = video.mean(axis=(1, 2))
+    elif video.ndim == 2:
+        trace = video.mean(axis=1)
+    else:
+        return None
+    # Detrend + FFT
+    trace = trace - trace.mean()
+    # Use scipy if available, else numpy
+    try:
+        from scipy.signal import detrend, find_peaks
+        trace = detrend(trace)
+    except ImportError:
+        pass
+    spectrum = np.abs(np.fft.rfft(trace))
+    freqs = np.fft.rfftfreq(T, d=1.0 / fps)
+    if len(freqs) < 2:
+        return None
+    # Skip DC bin (index 0)
+    spectrum[0] = 0
+    # Find dominant peak
+    peak_idx = np.argmax(spectrum[1:]) + 1
+    return round(float(freqs[peak_idx]), 2)
 
 
 # =============================================================================
@@ -330,15 +499,40 @@ def _merge_metadata(*sources: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _find_files_by_stem(directory: Path, suffix: str, base_name: Optional[str]) -> List[Path]:
+    """
+    Find files in directory matching the given suffix, filtered by base_name.
+    
+    Matching strategy (in order):
+      1. Parse sample_id from base_name (e.g. "0823-004A" → "004A"),
+         then match against sample_id parsed from each filename.
+      2. Soft match: base_name appears as substring in filename (case-insensitive).
+      3. Fallback: return all files with that suffix (don't starve the pipeline).
+    
+    This replaces the old split("_")[0] approach which broke on long filenames
+    like "20250822_TAC_bleb_baseline_6HZ0823-004A.rsh" (F42 bug).
+    """
     files = sorted(directory.glob(f"*.{suffix}"))
     if not base_name:
         return files
-    base_norm = base_name.upper().split("_")[0]
-    strict = [
-        f for f in files
-        if (parse_sample_id_from_filename(f.name) or "").upper().split("_")[0] == base_norm
-    ]
-    return strict
+
+    # 1. Sample-id match (primary)
+    target_sid = parse_sample_id_from_filename(base_name)
+    if target_sid:
+        matches = [
+            f for f in files
+            if (parse_sample_id_from_filename(f.name) or "").upper() == target_sid.upper()
+        ]
+        if matches:
+            return matches
+
+    # 2. Soft substring match (secondary)
+    base_upper = base_name.upper()
+    soft = [f for f in files if base_upper in f.name.upper()]
+    if soft:
+        return soft
+
+    # 3. No match found — return empty (don't return wrong files)
+    return []
 
 
 def _validate_frame_count(
@@ -351,11 +545,18 @@ def _validate_frame_count(
         return None
     declared = metadata["n_frames"]
     if base_name:
-        base_norm = base_name.upper().split("_")[0]
-        chunks = sorted([
-            c for c in directory.glob("*.rsd")
-            if (parse_sample_id_from_filename(c.name) or "").upper().split("_")[0] == base_norm
-        ])
+        target_sid = parse_sample_id_from_filename(base_name)
+        if target_sid:
+            chunks = sorted([
+                c for c in directory.glob("*.rsd")
+                if (parse_sample_id_from_filename(c.name) or "").upper() == target_sid.upper()
+            ])
+        else:
+            base_upper = base_name.upper()
+            chunks = sorted([
+                c for c in directory.glob("*.rsd")
+                if base_upper in c.name.upper()
+            ])
     else:
         chunks = sorted(directory.glob("*.rsd"))
     if not chunks:
@@ -429,6 +630,33 @@ def extract_micam_metadata(
         s = parse_stim_hz_from_filename(fname)
         if s is not None:
             merged["stim_hz"] = s
+            merged["stim_hz_source"] = "filename"
+
+    # Protocol / condition metadata from filename
+    if merged.get("protocol") is None:
+        p = parse_protocol_from_filename(fname)
+        if p:
+            merged["protocol"] = p
+    if merged.get("timepoint") is None:
+        tp = parse_timepoint_from_filename(fname)
+        if tp is not None:
+            merged["timepoint"] = tp
+    if merged.get("model") is None:
+        mdl = parse_model_from_filename(fname)
+        if mdl:
+            merged["model"] = mdl
+    if merged.get("drug") is None:
+        drugs = parse_drugs_from_filename(fname)
+        if drugs:
+            if len(drugs) == 1:
+                merged["drug"] = drugs[0]
+            else:
+                merged["drug"] = drugs[0]  # primary drug
+                merged["drugs"] = drugs     # all drugs
+    if merged.get("tissue") is None:
+        tis = parse_tissue_from_filename(fname)
+        if tis:
+            merged["tissue"] = tis
 
     merged["recording_mode"] = recording_mode_from_dye(merged.get("dye"))
 
