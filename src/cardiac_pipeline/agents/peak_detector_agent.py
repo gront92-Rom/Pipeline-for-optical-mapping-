@@ -62,7 +62,7 @@ class PeakDetectorAgent(BaseAgent):
     PeakDetectorAgent — unified preprocessing + beat detection stage.
 
     Inputs (lazy):
-      - must/loaded_video.npy  (from LoaderAgent)
+      - must/raw_video.npy  (from LoaderAgent)
       - must/mask.npy          (from MaskAgent)
       - must/metadata.json     (from LoaderAgent)
 
@@ -141,12 +141,12 @@ class PeakDetectorAgent(BaseAgent):
         return self.load_must("mask.npy").astype(bool)
 
     def _load_video(self) -> np.ndarray:
-        """Load loaded_video.npy, run LoaderAgent if missing."""
-        if not self.exists("loaded_video.npy"):
-            self.logger.info("loaded_video.npy not found — running LoaderAgent")
+        """Load raw_video.npy, run LoaderAgent if missing."""
+        if not self.exists("raw_video.npy"):
+            self.logger.info("raw_video.npy not found — running LoaderAgent")
             from cardiac_pipeline.agents.loader_agent import LoaderAgent
             LoaderAgent(self.sample_id, self.config).run()
-        return self.load_must("loaded_video.npy")
+        return self.load_must("raw_video.npy")
 
     # ==================== RUN ====================
 

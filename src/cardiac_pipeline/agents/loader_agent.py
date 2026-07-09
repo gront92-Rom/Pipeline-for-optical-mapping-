@@ -308,6 +308,31 @@ class LoaderAgent(BaseAgent):
         # --- 5. Сохранение сырого видео ---
         self.save_must(video, "raw_video.npy")
 
+        # --- 5b. Загрузка .rsm (background frame) для MaskAgent PRIMARY ---
+        rsm_path = input_path.with_suffix(".rsm")
+        if not rsm_path.exists():
+            # Try alternate: replace .rsh with .rsm in the same directory
+            rsm_path = input_path.parent / (input_path.stem + ".rsm")
+        if rsm_path.exists():
+            try:
+                rsm_raw = np.fromfile(str(rsm_path), dtype=np.uint16)
+                orig_W = 128  # MiCAM ULTIMA sensor width (before crop)
+                expected = H * orig_W
+                if rsm_raw.size >= expected:
+                    rsm_frame = rsm_raw[:expected].reshape(H, orig_W)
+                    # Apply same crop as video
+                    if self.crop_left + self.crop_right > 0:
+                        rsm_frame = rsm_frame[:, self.crop_left:orig_W - self.crop_right]
+                    rsm_3d = rsm_frame[np.newaxis, :, :].astype(np.float32)  # (1, H, W_crop)
+                    self.save_must(rsm_3d, "raw_rsm.npy")
+                    self.logger.info(f"raw_rsm.npy сохранён: {rsm_3d.shape} из {rsm_path.name}")
+                else:
+                    self.logger.warning(f"rsm size {rsm_raw.size} < expected {expected} — пропускаю")
+            except Exception as e:
+                self.logger.warning(f"Не удалось загрузить .rsm ({e}) — MaskAgent будет использовать fallback")
+        else:
+            self.logger.info(f".rsm не найден рядом с {input_path.name} — MaskAgent будет использовать fallback")
+
         # --- 6. Sideline-гейтинг ---
         if T >= self.sideline_threshold:
             result = self._handle_sideline(video, metadata)
