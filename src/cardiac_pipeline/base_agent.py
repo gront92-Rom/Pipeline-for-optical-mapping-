@@ -68,6 +68,7 @@ class PipelineConfig:
         self.loader = self._get("loader", {})
         self.mask = self._get("mask", {})
         self.preprocess = self._get("preprocess", {})
+        self.peak_detector = self._get("peak_detector", {})
         self.activation = self._get("activation", {})
         self.apd = self._get("apd", {})
         self.conduction = self._get("conduction", {})

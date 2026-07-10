@@ -88,19 +88,38 @@ alternans:
   sign_floor_ms: 0.5
   discordant_threshold: 0.25
 
-# --- Peak Detector (v3.6 spec, 2026-07-09) ---
+# --- Peak Detector ---
+# v3.6 spec, 2026-07-09 — single-trace mode (legacy baseline, tag: v3.6-baseline)
+# v3.7 spec, 2026-07-09 — multi-trace mode (3 regions, voting, soft assignment)
+#
 # Architecture: PeakDetectorAgent is a CONSUMER (Variant A).
 #   - LoaderAgent owns preprocessing (inversion, LPF, normalization).
 #   - PeakDetectorAgent aggregates 1D mean_tissue from preproc + mask
 #     and calls detect_beats(mean_tissue, fps, stim_hz).
 #   - ActivationAgent uses peaks as upstroke 50% crossings (NOT apex).
 #   - APDAgent finds local argmax around each peak for amp/APD.
+#
+# v3.7 multi-trace:
+#   - n_regions=3 traces from 3x3 mask_grid (top-3 by mean pixel_std)
+#   - Consensus peaks: voted across regions (min_agreement >= 2 of 3)
+#   - Soft assignment: Gaussian weights for per-pixel region influence
+#   - Top-3 consensus beats selected by quality for downstream APD
 peak_detector:
+  # v3.6 (single-trace) — kept for back-compat, used when n_regions=1
   sigma_temporal: 3.0          # Gaussian LPF sigma in frames (static, NOT dynamic)
   threshold_frac: 0.5          # Rising edge at 50% of max amp (upstroke midpoint)
   min_distance_factor: 0.6     # Min distance between peaks = BCL * 0.6 (frames)
   drop_first: false            # Do NOT hardcode drop — QC owns startup artifact gate
   min_peaks: 3                 # Agent gating: raise if n_peaks < 3
+
+  # v3.7 multi-trace mode
+  n_regions: 3                 # 1 = legacy single-trace, 3 = multi-trace
+  min_region_pixels: 50        # minimum pixels per region (else skip)
+  min_agreement: 2             # ≥ N regions must agree on a peak
+  frame_tolerance: 10          # ±10 frames = ±20ms @ 500fps grouping window
+  soft_assignment_sigma: 20.0  # Gaussian sigma for pixel-to-region weights (pixels)
+  min_quality: 0.66            # min fraction of regions agreeing (0.66 = 2/3)
+  n_beats_select: 3            # top-N consensus beats selected for downstream APD
 
 # --- QC / Judge ---
 qc:
