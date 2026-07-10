@@ -129,7 +129,7 @@ def compute_gradient_angular(
 
     Логика:
       1. Gaussian smooth activation map (σ=smooth_sigma)
-      2. Sobel → gx, gy → |∇T|
+      2. np.gradient → gx, gy → |∇T|
       3. CV = 1/|∇T| где |∇T| > grad_threshold (выкидывает плоские)
       4. Clip CV [cv_min, cv_max]
       5. Erode mask (убрать края)
@@ -151,14 +151,14 @@ def compute_gradient_angular(
                           activation_map, np.nanmean(activation_map[mask]))
     act = gaussian_filter(act_filled, sigma=smooth_sigma)
 
-    # 2. Sobel gradients
-    gy = sobel(act, axis=0) / pixel_size_mm  # ms/mm
-    gx = sobel(act, axis=1) / pixel_size_mm
+    # 2. Gradients via np.gradient (central difference, 2nd-order accurate)
+    #    NOTE: Sobel inflates |∇T| by ~√2 due to [1,2,1] kernel → CV underestimated.
+    #    np.gradient gives raw central difference — matches old hybrid_structure_tensor.
+    gy_px, gx_px = np.gradient(act)
+    gy = gy_px / pixel_size_mm  # ms/mm
+    gx = gx_px / pixel_size_mm
 
     grad_mag = np.hypot(gx, gy)  # |∇T| ms/mm
-
-    # 2b. Light smoothing of gradient magnitude (reduces noise, preserves edges)
-    grad_mag = gaussian_filter(grad_mag, sigma=1.0)
 
     # 3. CV = 1/|∇T|, only where |∇T| > threshold
     cv_map = np.zeros_like(grad_mag)
