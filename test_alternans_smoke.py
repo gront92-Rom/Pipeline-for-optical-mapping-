@@ -155,7 +155,7 @@ try:
     check("min_beats from config",      agent.min_beats == 4, f"min_beats={agent.min_beats}")
     check("sign_floor_ms from config",  agent.sign_floor_ms == 0.5,
           f"sign_floor_ms={agent.sign_floor_ms}")
-    check("discordant_threshold",       agent.discordant_threshold == 0.25,
+    check("discordant_threshold",       agent.discordant_threshold == 0.7,
           f"discordant_threshold={agent.discordant_threshold}")
 except Exception as e:
     check("AlternansAgent imports OK", False, str(e))

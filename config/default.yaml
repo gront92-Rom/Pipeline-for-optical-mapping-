@@ -82,11 +82,10 @@ conduction:
 # --- Alternans ---
 alternans:
   min_beats: 4
+  ac_threshold_ms: 2.0           # AC_95th >= this → alternans present
   ac_pct_thresholds: [5, 10, 20]
-  f_dom_target: 0.5
-  f_dom_tolerance: 0.1
   sign_floor_ms: 0.5
-  discordant_threshold: 0.25
+  discordant_threshold: 0.7      # concordance < this → discordant (checkerboard ~0.55)
 
 # --- Peak Detector ---
 # v3.6 spec, 2026-07-09 — single-trace mode (legacy baseline, tag: v3.6-baseline)

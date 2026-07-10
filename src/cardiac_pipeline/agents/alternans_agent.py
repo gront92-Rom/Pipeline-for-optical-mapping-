@@ -353,8 +353,7 @@ class AlternansAgent(BaseAgent):
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            _, freqs, _ = compute_temporal_spectrum(temporal_diffs)
-            spec, _, _  = compute_temporal_spectrum(temporal_diffs)
+            spec, freqs, _ = compute_temporal_spectrum(temporal_diffs)
 
             fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
