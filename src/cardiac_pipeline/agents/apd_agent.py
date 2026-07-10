@@ -1,50 +1,30 @@
-#!/usr/bin/env python3
 """
-apd_agent.py — Stage 6: Расчёт длительности потенциала действия / CaT (APD/CaT Map).
-Версия v1 (2026-07-02).
+apd_agent.py — Stage 4: Action Potential Duration (APD) map.
 
-Архитектура:
-  Наследует BaseAgent. Читает параметры из PipelineConfig (config/default.yaml).
-  Все пути — через self.get_path() / BaseAgent API.
-  Вся математика вынесена в utils/signal.py.
+v3.7 spec (2026-07-09, developer review):
 
-Входные данные (lazy — запускает ActivationAgent если нужно):
-  - debug/preproc_video_apd.npy  — видео, препроцессированное с target_stage="apd" (150 Гц LPF)
-    Если отсутствует — использует debug/preproc_video.npy от PeakDetectorAgent.
-  - must/peaks.npy               — глобальные пики биений (от PeakDetectorAgent)
-  - must/mask.npy                — маска ткани (от MaskAgent)
-  - must/metadata.json           — fps, dye (от LoaderAgent)
+  - Uses PeakDet v3.7 outputs: selected_peaks, peaks_per_region, weights
+  - Soft-weighted per-region APD (weighted average, NOT median)
+  - Hot mask by percentile (default 50 = top 50% std pixels)
+  - Active pixel loop: iterate only over hot_mask pixels
+  - Dynamic min_amp: max(100, 3 * sigma_noise)
+  - Outlier rejection: APD > max(BCL*0.9, 300ms) or APD < 10ms
+  - Single-pass detection for all levels (30/50/80)
 
-Выходные данные:
-  MUST:
-    - apd30_map.npy / cat30_map.npy   — медианная карта APD30/CaT30 (мс)
-    - apd50_map.npy / cat50_map.npy   — медианная карта APD50/CaT50 (мс)
-    - apd80_map.npy / cat80_map.npy   — медианная карта APD80/CaT80 (мс)
-    - apd_per_beat_3d.npz             — 3D стек (H, W, N_beats) для Stage 7 (Альтернанс)
-    - apd_report.json                 — вердикт, метрики, параметры
-  DEBUG:
-    - apd30_map.png / apd50_map.png / apd80_map.png — PNG-карты
-    - apd_traces.png                  — диагностические трейсы 4 угловых ROI
-    - apd_debug.json                  — детали QC
+Outputs (per run):
 
-Коды возврата (CLI-режим):
-  0 = SUCCESS
-  1 = CRASH (исключение инфраструктуры)
-  2 = REJECT (QC не пройден)
+  must/:
+    - apd30_map.npy     (H, W) — median APD30 over selected beats
+    - apd50_map.npy     (H, W)
+    - apd80_map.npy     (H, W)
+    - apd_report.json   — summary statistics
 
-Исправления относительно исходного apd_agent.py:
-  - from utils_apd import ... → from cardiac_pipeline.utils.signal import ...
-  - fps берётся из metadata.json через _get_fps() (не из --fps аргумента)
-  - dye берётся из metadata.json через _get_dye() (не из metadata.get("dye", "A"))
-  - Параметры (min_amplitude, qc_min_coverage) берутся из PipelineConfig / config.yaml
-  - Все пути через BaseAgent API (must_dir / debug_dir)
-  - validate_apd_semantics перенесена в utils/signal.py
-  - Диапазоны VSD/CaT берутся из конфига (apd_min_ms, apd_max_ms)
-  - Добавлен lazy-механизм: проверяет наличие preproc_video_apd.npy
-  - Добавлен _ensure_upstream() для PeakDetectorAgent
-  - Вердикт REJECT → raise ValueError (соответствует BaseAgent-контракту)
-  - PNG-визуализация сохраняется в debug/ (не в must/)
+  debug/:
+    - apd_4d.npy        (n_levels, H, W, n_beats) — raw per-beat APD
+    - hot_mask.npy      (H, W) bool — pixels included in analysis
+    - min_amp.npy       float — dynamic threshold used
 """
+from __future__ import annotations
 
 import json
 import logging
@@ -55,528 +35,279 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from cardiac_pipeline.base_agent import BaseAgent, PipelineConfig
-from cardiac_pipeline.utils.signal import (
-    masked_spatial_pool,
-    find_upstroke_start,
-    find_repol_crossing_with_fallback,
-    get_4_corners_snapped,
-    validate_apd_semantics,
+from cardiac_pipeline.utils.apd_detector import (
+    DEFAULT_LEVELS,
+    DEFAULT_HOT_PIXEL_PERCENTILE,
+    DEFAULT_MIN_AMP_ABS,
+    DEFAULT_MIN_AMP_NOISE_MULT,
+    compute_hot_mask,
+    compute_per_pixel_min_amp,
+    detect_all_apd_levels_pixel,
+    estimate_noise_sigma,
+    reject_apd_outliers,
 )
 
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# APDAgent
-# ---------------------------------------------------------------------------
 
 class APDAgent(BaseAgent):
-    """
-    Stage 6: Расчёт карт APD/CaT и 3D стека биений.
+    """Stage 4: Per-pixel APD30/50/80 detection."""
 
-    Потребляет препроцессированное видео + пики от PeakDetectorAgent.
-    Генерирует карты APD30/50/80 (или CaT30/50/80) и 3D стек для Stage 7.
-    """
+    DEPENDS_ON = []  # explicitly set in pipeline runner
+    REQUIRED_INPUTS = [
+        "preproc_video.npy",
+        "mask.npy",
+        "peaks.npy",
+        "selected_peaks.npy",
+        "peaks_per_region.npy",
+        "weights.npy",
+    ]
 
-    DEPENDS_ON: list = []  # [PeakDetectorAgent] — установлен ниже (lazy import)
-    REQUIRED_INPUTS: list = ["peaks.npy", "mask.npy"]
-
-    def __init__(
-        self,
-        sample_id: str,
-        config: Optional[PipelineConfig] = None,
-    ):
+    def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
         super().__init__(sample_id, config)
 
-        apd_cfg = self.config.apd if isinstance(self.config.apd, dict) else {}
-
-        # Параметры из конфига
-        self.min_amplitude:   float = float(apd_cfg.get("min_amplitude",   0.001))
-        self.qc_min_coverage: float = float(apd_cfg.get("qc_min_coverage", 0.25))
-        self.roi_pool_size:   int   = int(apd_cfg.get("roi_pool_size",     3))
-        self.apd_min_ms:      float = float(apd_cfg.get("apd_min_ms",      5.0))
-        self.apd_max_ms:      float = float(apd_cfg.get("apd_max_ms",      500.0))
-
-        # Метаданные (заполняются в run())
-        self.metadata: Dict[str, Any] = {}
-
-    # ------------------------------------------------------------------
-    # Вспомогательные методы
-    # ------------------------------------------------------------------
-
-    def _load_metadata(self) -> Dict[str, Any]:
-        meta_path = self.get_path("metadata.json", kind="must")
-        if meta_path.exists():
-            with open(meta_path, encoding="utf-8") as f:
-                self.metadata = json.load(f)
+        # Read APD config
+        apd_cfg = getattr(self.config, "apd", None)
+        if not apd_cfg:
+            apd_cfg = {}
+        # Back-compat: nested access for dict
+        if hasattr(apd_cfg, "levels"):
+            self.levels = list(apd_cfg.levels)
         else:
-            self.metadata = {}
-            self.logger.warning("metadata.json not found")
-        return self.metadata
+            self.levels = apd_cfg.get("levels", DEFAULT_LEVELS)
 
-    def _get_fps(self) -> float:
-        fps = self.metadata.get("fps") or self.metadata.get("fps_hz")
-        if fps is None:
-            raise ValueError(
-                "fps отсутствует в metadata.json. "
-                "Запустите LoaderAgent для извлечения метаданных из .gsh/.rsh."
-            )
-        fps = float(fps)
-        if fps <= 0:
-            raise ValueError(f"fps некорректен (fps={fps})")
-        return fps
+        if hasattr(apd_cfg, "hot_pixel_percentile"):
+            self.hot_pixel_percentile = int(apd_cfg.hot_pixel_percentile)
+        else:
+            self.hot_pixel_percentile = int(apd_cfg.get(
+                "hot_pixel_percentile", DEFAULT_HOT_PIXEL_PERCENTILE))
 
-    def _get_dye(self) -> str:
-        """Возвращает 'A' (VSD/вольтаж) или 'B' (Ca²⁺). Обязательно из метаданных."""
-        dye = self.metadata.get("dye") or self.metadata.get("recording_mode")
-        if dye is None:
-            self.logger.warning(
-                "dye не найден в metadata.json — используется дефолт 'A' (VSD). "
-                "Убедитесь, что LoaderAgent корректно парсит имя файла."
-            )
-            return "A"
-        # Нормализация: "voltage"/"vsd"/"ap" → "A", "calcium"/"cat"/"ca" → "B"
-        d = str(dye).upper().strip()
-        if d in ("A", "VOLTAGE", "VSD", "AP"):
-            return "A"
-        if d in ("B", "CALCIUM", "CAT", "CA"):
-            return "B"
-        self.logger.warning(f"Неизвестный dye='{dye}', используется 'A' (VSD)")
-        return "A"
+        if hasattr(apd_cfg, "min_amp_abs"):
+            self.min_amp_abs = float(apd_cfg.min_amp_abs)
+        else:
+            self.min_amp_abs = float(apd_cfg.get(
+                "min_amp_abs", DEFAULT_MIN_AMP_ABS))
 
-    def _load_preproc_video(self) -> np.ndarray:
-        """
-        Загружает препроцессированное видео для APD (150 Гц LPF).
+        if hasattr(apd_cfg, "min_amp_noise_mult"):
+            self.min_amp_noise_mult = float(apd_cfg.min_amp_noise_mult)
+        else:
+            self.min_amp_noise_mult = float(apd_cfg.get(
+                "min_amp_noise_mult", DEFAULT_MIN_AMP_NOISE_MULT))
 
-        Variant A (2026-07-09): LoaderAgent is the sole producer of both:
-          1. must/preproc_video_apd.npy  — 150 Гц LPF (для APD-ветки)
-          2. must/preproc_video.npy      —  80 Гц LPF (для PeakDetector/Activation/Alternans)
-
-        Приоритет:
-          1. must/preproc_video_apd.npy  — специально препроцессированное для APD
-          2. must/preproc_video.npy      — стандартное (80 Гц LPF, fallback)
-        """
-        apd_path = self.get_path("preproc_video_apd.npy", kind="must")
-        if apd_path.exists():
-            self.logger.info(f"Загружаю must/preproc_video_apd.npy (150 Гц LPF)")
-            return np.load(apd_path)
-
-        std_path = self.get_path("preproc_video.npy", kind="must")
-        if std_path.exists():
-            self.logger.warning(
-                "preproc_video_apd.npy не найден — использую must/preproc_video.npy (80 Гц LPF). "
-                "Variant A: LoaderAgent должен сохранять preproc_video_apd.npy отдельно."
-            )
-            return np.load(std_path)
-
-        # Backward-compat: legacy debug/ locations
-        legacy_apd = self.get_path("preproc_video_apd.npy", kind="debug")
-        if legacy_apd.exists():
-            return np.load(legacy_apd)
-        legacy_std = self.get_path("preproc_video.npy", kind="debug")
-        if legacy_std.exists():
-            return np.load(legacy_std)
-
-        raise FileNotFoundError(
-            f"Не найдено ни preproc_video_apd.npy, ни preproc_video.npy в must/ или debug/. "
-            f"Запустите LoaderAgent (Variant A)."
-        )
-
-    # ------------------------------------------------------------------
-    # Главный метод
-    # ------------------------------------------------------------------
+        # Detected levels must be sorted (for output naming consistency)
+        self.levels = sorted(self.levels)
 
     def run(self, force: bool = False, **kwargs) -> Dict[str, Any]:
-        """
-        Запускает расчёт APD/CaT карт.
+        """Run Stage 4: APD map computation."""
+        t0 = time.time()
 
-        Порядок:
-          1. Lazy-проверка upstream (PeakDetectorAgent)
-          2. Загрузка метаданных → fps, dye
-          3. Загрузка входных данных (видео, пики, маска)
-          4. 3×3 ROI-пулинг под маской
-          5. Отброс крайних биений (первое и последнее)
-          6. Попиксельный цикл: апстрок + реполяризация × 3 уровня
-          7. Медианные 2D карты + триангуляция
-          8. Угловые ROI-кластеры (вариация биений)
-          9. Семантическая валидация + QC-гейтинг
-          10. Сохранение артефактов (npy, npz, json, png)
-        """
-        # Lazy-проверка: если карты уже есть — пропускаем
-        if not force and self.exists("apd_report.json"):
-            self.logger.info("apd_report.json exists, skipping")
-            return {"status": "skipped"}
-
-        t0 = time.perf_counter()
-
-        # --- Lazy: запускаем PeakDetector (→ Loader → Mask) если выходы отсутствуют ---
-        from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
-        self.DEPENDS_ON = [PeakDetectorAgent]
+        # === Lazy dependencies ===
         self.ensure_dependencies(force=force)
 
-        # --- 2. Метаданные ---
-        self._load_metadata()
+        # === 1. Load required inputs ===
+        self.logger.info(f"[APD] Loading inputs from {self.must_dir}")
+        preproc_video = np.load(self.must_dir / "preproc_video.npy")  # (T, H, W)
+        mask = np.load(self.must_dir / "mask.npy").astype(bool)  # (H, W)
 
-        fps = self._get_fps()
-        dye = self._get_dye()
-        metric = "APD" if dye == "A" else "CaT"
+        with open(self.must_dir / "metadata.json") as f:
+            metadata = json.load(f)
+        fps = float(metadata["fps"])
+        stim_hz = float(metadata.get("stim_hz", 5.86))
 
-        # --- 3. Загрузка входных данных ---
-        preproc_video = self._load_preproc_video()
-        all_peaks = self.load_must("peaks.npy")
-        mask = self.load_must("mask.npy").astype(bool)
+        # PeakDet v3.7 outputs
+        selected_peaks = np.load(self.must_dir / "selected_peaks.npy")  # (n_beats,)
+        selected_peaks = selected_peaks[selected_peaks >= 0]  # strip padding
+        peaks_per_region = np.load(self.must_dir / "peaks_per_region.npy")  # (n_regions, max_beats)
+        weights = np.load(self.must_dir / "weights.npy")  # (H, W, n_regions)
+
         T, H, W = preproc_video.shape
+        n_regions = peaks_per_region.shape[0]
+        n_beats = len(selected_peaks)
 
         self.logger.info(
-            f"APDAgent: video={preproc_video.shape}, peaks={len(all_peaks)}, "
-            f"mask_cov={mask.mean():.3f}, fps={fps}, dye={dye} ({metric})"
+            f"[APD] preproc=({T},{H},{W}), mask_coverage={mask.mean():.3f}, "
+            f"fps={fps}, stim_hz={stim_hz}, n_beats={n_beats}, n_regions={n_regions}"
         )
 
-        # --- 4. 3×3 ROI-пулинг ---
-        self.logger.info(f"3×3 ROI spatial pooling (mask-aware)...")
-        video_roi = masked_spatial_pool(preproc_video, mask, size=self.roi_pool_size)
+        # === 2. Compute hot mask ===
+        hot_mask = compute_hot_mask(preproc_video, mask, self.hot_pixel_percentile)
+        active_coords = np.argwhere(hot_mask)  # (N_active, 2) — [[y, x], ...]
+        n_active = len(active_coords)
+        self.logger.info(
+            f"[APD] Hot mask: {n_active} active pixels "
+            f"(percentile={self.hot_pixel_percentile}, "
+            f"{n_active/mask.sum()*100:.1f}% of masked)"
+        )
 
-        # --- 5. Отброс крайних биений ---
-        if len(all_peaks) >= 3:
-            valid_peaks = all_peaks[1:-1]
-            self.logger.info(
-                f"Биений: {len(all_peaks)}, отброшены первое и последнее. "
-                f"В анализе: {len(valid_peaks)}"
-            )
+        if n_active == 0:
+            raise ValueError("[APD] No active pixels — hot mask is empty")
+
+        # === 3. Estimate noise sigma ===
+        sigma_noise = estimate_noise_sigma(preproc_video, mask, fps)
+        min_amp = compute_per_pixel_min_amp(
+            preproc_video, mask, sigma_noise,
+            abs_floor=self.min_amp_abs,
+            noise_multiplier=self.min_amp_noise_mult,
+        )
+        self.logger.info(
+            f"[APD] sigma_noise={sigma_noise:.2f}, min_amp={min_amp:.2f} "
+            f"(abs_floor={self.min_amp_abs}, noise_mult={self.min_amp_noise_mult})"
+        )
+
+        # === 4. Compute BCL ===
+        if len(selected_peaks) > 1:
+            dt_ms = np.diff(selected_peaks) / fps * 1000.0
+            bcl_ms = float(np.median(dt_ms))
         else:
-            valid_peaks = all_peaks
-            self.logger.warning(
-                f"Критически мало биений ({len(all_peaks)}). Используем все."
-            )
+            bcl_ms = 1000.0 / stim_hz if stim_hz > 0 else 167.0
+        self.logger.info(f"[APD] BCL={bcl_ms:.1f}ms (outlier threshold={max(bcl_ms*0.9, 300.0):.1f}ms)")
 
-        n_beats = len(valid_peaks)
+        # === 5. Main loop: iterate active pixels ===
+        # 4D array: (n_levels, H, W, n_beats)
+        apd_4d = np.full((len(self.levels), H, W, n_beats), np.nan, dtype=np.float32)
 
-        # --- 6. Попиксельный цикл ---
-        apd80_3d = np.full((H, W, n_beats), np.nan, dtype=np.float32)
-        apd50_3d = np.full((H, W, n_beats), np.nan, dtype=np.float32)
-        apd30_3d = np.full((H, W, n_beats), np.nan, dtype=np.float32)
-        amp_3d   = np.full((H, W, n_beats), np.nan, dtype=np.float32)
+        for pi, (h, w) in enumerate(active_coords):
+            if pi % 500 == 0 and pi > 0:
+                self.logger.debug(f"[APD]   processed {pi}/{n_active} pixels")
 
-        valid_pixels_count = 0
-        fallback_used_count = 0
+            for beat_i, peak_idx in enumerate(selected_peaks):
+                # Collect per-region APD for this pixel/beat
+                apd_per_region_by_level: Dict[int, List[float]] = {lv: [] for lv in self.levels}
+                weight_per_region: List[float] = []
 
-        for y in range(H):
-            for x in range(W):
-                if not mask[y, x]:
-                    continue
-
-                trace = video_roi[:, y, x]
-                pixel_has_valid_beat = False
-
-                for bi, pk in enumerate(valid_peaks):
-                    pk = int(pk)
-                    # Граница биения по полному массиву пиков
-                    global_bi = int(np.where(all_peaks == pk)[0][0])
-                    next_pk = int(all_peaks[global_bi + 1]) if global_bi + 1 < len(all_peaks) else T
-
-                    seg = trace[pk:next_pk]
-                    if len(seg) < 3:
+                for r in range(n_regions):
+                    peaks_r = peaks_per_region[r]
+                    if beat_i + 1 >= len(peaks_r):
                         continue
 
-                    # Локальный пик сокращения
-                    local_peak_idx = pk + int(np.argmax(seg))
-                    amp = float(trace[local_peak_idx])
-
-                    if amp < self.min_amplitude:
+                    peak_start_r = int(peaks_r[beat_i])
+                    peak_end_r = int(peaks_r[beat_i + 1])
+                    if peak_start_r < 0 or peak_end_r < 0:
                         continue
 
-                    up_idx, _, _ = find_upstroke_start(trace, local_peak_idx, amp, fps)
-                    if up_idx is None:
+                    apd_values = detect_all_apd_levels_pixel(
+                        preproc_video, int(h), int(w),
+                        peak_start_r, peak_end_r, fps,
+                        levels=self.levels, min_amp=min_amp,
+                    )
+
+                    # Filter outliers using BCL rule
+                    apd_filtered = reject_apd_outliers(apd_values, bcl_ms)
+
+                    # Accumulate per level
+                    for lv in self.levels:
+                        if lv in apd_filtered:
+                            apd_per_region_by_level[lv].append(apd_filtered[lv])
+                    weight_per_region.append(float(weights[h, w, r]))
+
+                # === Weighted average per level (FIX from developer review) ===
+                if weight_per_region:
+                    w_arr = np.array(weight_per_region)
+                    if w_arr.sum() > 0:
+                        w_norm = w_arr / w_arr.sum()
+                    else:
                         continue
+                    for lv_i, lv in enumerate(self.levels):
+                        vals = apd_per_region_by_level[lv]
+                        if len(vals) == 0:
+                            continue
+                        if len(vals) == 1:
+                            apd_4d[lv_i, h, w, beat_i] = vals[0]
+                        else:
+                            # np.average with normalized weights
+                            vals_arr = np.array(vals[:len(w_norm)])
+                            apd_4d[lv_i, h, w, beat_i] = float(
+                                np.average(vals_arr, weights=w_norm[:len(vals_arr)])
+                            )
 
-                    amp_3d[y, x, bi] = amp
-                    pixel_has_valid_beat = True
+        # === 6. Median over beats → spatial APD maps ===
+        apd_maps = {}
+        for lv_i, lv in enumerate(self.levels):
+            apd_maps[lv] = np.nanmedian(apd_4d[lv_i], axis=2)
 
-                    # Реполяризация для трёх уровней
-                    for threshold, arr3d in [(30, apd30_3d), (50, apd50_3d), (80, apd80_3d)]:
-                        cross, found, status = find_repol_crossing_with_fallback(
-                            trace, local_peak_idx, amp, fps,
-                            threshold=threshold,
-                            next_peak_idx=next_pk,
-                            total_frames=T,
-                        )
-                        if found and cross is not None:
-                            val_ms = (cross - up_idx) / fps * 1000.0
-                            # Физиологический коридор
-                            if self.apd_min_ms <= val_ms <= self.apd_max_ms:
-                                arr3d[y, x, bi] = val_ms
-                            if "fallback" in status:
-                                fallback_used_count += 1
+        # === 7. Save artifacts ===
+        for lv, apd_map in apd_maps.items():
+            self.save_must(apd_map.astype(np.float32), f"apd{lv}_map.npy")
 
-                if pixel_has_valid_beat:
-                    valid_pixels_count += 1
+        self.save_debug(apd_4d, "apd_4d.npy")
+        self.save_debug(hot_mask, "hot_mask.npy")
+        self.save_debug(np.array([min_amp], dtype=np.float32), "min_amp.npy")
 
-        # --- 7. Медианные 2D карты ---
-        apd80_map = np.nanmedian(apd80_3d, axis=2)
-        apd50_map = np.nanmedian(apd50_3d, axis=2)
-        apd30_map = np.nanmedian(apd30_3d, axis=2)
-        triangulation_map = apd80_map - apd30_map
-
-        # --- 8. Угловые ROI-кластеры ---
-        corners = get_4_corners_snapped(mask, padding=10)
-        corner_stats: List[Dict] = []
-        for c in corners:
-            cy, cx = c["y"], c["x"]
-            beats_80 = apd80_3d[cy, cx, :]
-            valid_b  = beats_80[np.isfinite(beats_80)]
-            if len(valid_b) > 0:
-                corner_stats.append({
-                    "label":               c["label"],
-                    "coords":              [cy, cx],
-                    "APD80_median":        round(float(np.median(valid_b)), 2),
-                    "APD80_std":           round(float(np.std(valid_b)), 2),
-                    "APD80_iqr":           round(float(np.percentile(valid_b, 75) - np.percentile(valid_b, 25)), 2),
-                    "Triangulation_median": round(float(triangulation_map[cy, cx]), 2)
-                                           if np.isfinite(triangulation_map[cy, cx]) else None,
-                })
-            else:
-                corner_stats.append({"label": c["label"], "status": "No valid beats captured"})
-
-        # --- 9. Метрики и QC ---
-        total_mask = int(np.sum(mask))
-        acceptance = valid_pixels_count / total_mask if total_mask > 0 else 0.0
-
-        valid_apd80_pixels = apd80_map[mask & np.isfinite(apd80_map)]
-        apd80_spatial_med  = float(np.median(valid_apd80_pixels)) if len(valid_apd80_pixels) > 0 else float("nan")
-        apd50_spatial_med  = float(np.nanmedian(apd50_map[mask])) if valid_pixels_count > 0 else float("nan")
-        apd30_spatial_med  = float(np.nanmedian(apd30_map[mask])) if valid_pixels_count > 0 else float("nan")
-
-        spatial_dispersion = (
-            float(np.percentile(valid_apd80_pixels, 95) - np.percentile(valid_apd80_pixels, 5))
-            if len(valid_apd80_pixels) > 0 else float("nan")
-        )
-
-        verdict, reason = validate_apd_semantics(
-            apd80_spatial_med, apd30_spatial_med, dye,
-            vsd_apd80_range=(self.apd_min_ms, self.apd_max_ms),
-            cat_apd80_range=(self.apd_min_ms, self.apd_max_ms),
-        )
-
-        elapsed = round(time.perf_counter() - t0, 2)
-
+        # Compute summary statistics
         report = {
-            "sample_id":               self.sample_id,
-            "status":                  "SUCCESS",
-            "metric":                  metric,
-            "fps_used":                fps,
-            "dye":                     dye,
-            "valid_beats_used":        n_beats,
-            "acceptance_rate":         round(acceptance, 4),
-            "fallback_recoveries":     fallback_used_count,
-            "spatial_stats": {
-                f"{metric.lower()}80_median":             round(apd80_spatial_med, 1),
-                f"{metric.lower()}50_median":             round(apd50_spatial_med, 1),
-                f"{metric.lower()}30_median":             round(apd30_spatial_med, 1),
-                "spatial_dispersion_repol_95_5":          round(spatial_dispersion, 1),
-                "triangulation_tissue_median":            round(float(np.nanmedian(triangulation_map[mask])), 1),
-            },
-            "clusters_variation_analysis": corner_stats,
-            "semantic_verdict":        verdict,
-            "reason":                  reason,
-            "elapsed_s":               elapsed,
+            "sample_id": self.sample_id,
+            "fps": fps,
+            "stim_hz": stim_hz,
+            "bcl_ms": bcl_ms,
+            "n_levels": len(self.levels),
+            "levels": self.levels,
+            "n_beats": n_beats,
+            "n_regions": n_regions,
+            "n_active_pixels": n_active,
+            "hot_pixel_percentile": self.hot_pixel_percentile,
+            "sigma_noise": sigma_noise,
+            "min_amp": min_amp,
+            "min_amp_abs_floor": self.min_amp_abs,
+            "min_amp_noise_mult": self.min_amp_noise_mult,
+            "apd_outlier_threshold_ms": max(bcl_ms * 0.9, 300.0),
+            "apd_min_threshold_ms": 10.0,
+            "elapsed_s": time.time() - t0,
         }
 
-        # QC-гейтинг
-        if acceptance < self.qc_min_coverage or verdict == "FAIL":
-            report["status"] = "REJECT"
-            report["reason"] = (
-                reason if verdict == "FAIL"
-                else f"Low valid tissue coverage ({acceptance:.1%} < {self.qc_min_coverage:.0%})"
-            )
-            self.save_must(report, "apd_report.json")
-            self.logger.error(f"QC REJECT: {report['reason']}")
-            raise ValueError(
-                f"APD map rejected: {report['reason']}. "
-                f"Sample {self.sample_id} requires manual review."
-            )
-
-        # --- 10. Сохранение артефактов ---
-        m = metric.lower()
-        self.save_must(apd30_map, f"{m}30_map.npy")
-        self.save_must(apd50_map, f"{m}50_map.npy")
-        self.save_must(apd80_map, f"{m}80_map.npy")
-
-        # 3D стек для Stage 7 (Альтернанс)
-        npz_path = self.must_dir / "apd_per_beat_3d.npz"
-        np.savez_compressed(
-            npz_path,
-            apd80=apd80_3d, apd50=apd50_3d, apd30=apd30_3d, amp=amp_3d,
-            n_beats=n_beats, metric=metric,
-        )
-        self.logger.info(f"[MUST] Saved: apd_per_beat_3d.npz")
+        for lv, apd_map in apd_maps.items():
+            valid = apd_map[hot_mask & np.isfinite(apd_map)]
+            if len(valid) > 0:
+                report[f"apd{lv}_median_ms"] = float(np.median(valid))
+                report[f"apd{lv}_iqr_ms"] = [
+                    float(np.percentile(valid, 25)),
+                    float(np.percentile(valid, 75)),
+                ]
+                report[f"apd{lv}_n_valid"] = int(len(valid))
+                report[f"apd{lv}_n_detected"] = int((hot_mask & np.isfinite(apd_map)).sum())
+            else:
+                report[f"apd{lv}_median_ms"] = None
+                report[f"apd{lv}_iqr_ms"] = None
+                report[f"apd{lv}_n_valid"] = 0
+                report[f"apd{lv}_n_detected"] = 0
 
         self.save_must(report, "apd_report.json")
 
-        # Debug: PNG-карты и диагностические трейсы
-        self._save_png_maps(apd30_map, apd50_map, apd80_map, mask, metric)
-        self._save_diagnostic_traces(video_roi, valid_peaks, all_peaks, corners, fps, metric, T)
-
-        self.save_debug({
-            "acceptance_rate":     acceptance,
-            "fallback_recoveries": fallback_used_count,
-            "semantic_verdict":    verdict,
-            "reason":              reason,
-            "corner_stats":        corner_stats,
-        }, "apd_debug.json")
-
-        self._log_metrics({
-            f"{m}80_median":   apd80_spatial_med,
-            f"{m}50_median":   apd50_spatial_med,
-            "acceptance_rate": acceptance,
-            "verdict":         verdict,
-            "elapsed_s":       elapsed,
-        })
-
         self.logger.info(
-            f"APDAgent done in {elapsed}s — {verdict}. "
-            f"Coverage: {acceptance:.1%}, {metric}80 median: {apd80_spatial_med:.1f} ms"
+            f"[APD] Done in {time.time()-t0:.2f}s. "
+            f"APD80 median={report.get('apd80_median_ms', 'NA')}ms, "
+            f"valid={report.get('apd80_n_valid', 0)}/{n_active}"
         )
 
         return {
-            "status":          "success",
-            "verdict":         verdict,
-            "acceptance_rate": acceptance,
-            "metrics":         report["spatial_stats"],
+            "status": "success",
+            "n_active_pixels": n_active,
+            "apd_maps_paths": {str(lv): str(self.must_dir / f"apd{lv}_map.npy")
+                               for lv in self.levels},
+            "metrics": report,
         }
 
-    # ------------------------------------------------------------------
-    # Вспомогательные методы визуализации
-    # ------------------------------------------------------------------
 
-    def _save_png_maps(
-        self,
-        apd30_map: np.ndarray,
-        apd50_map: np.ndarray,
-        apd80_map: np.ndarray,
-        mask: np.ndarray,
-        metric: str,
-    ):
-        """Сохраняет PNG-карты APD30/50/80 в debug/."""
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            m = metric.lower()
-            for lvl, data in [("30", apd30_map), ("50", apd50_map), ("80", apd80_map)]:
-                plt.figure(figsize=(6, 5))
-                masked_data = np.ma.masked_where(~mask, data)
-                plt.imshow(masked_data, cmap="jet")
-                plt.colorbar(label="ms")
-                plt.title(f"Spatial Map: {metric}{lvl}")
-                plt.tight_layout()
-                png_path = self.debug_dir / f"{m}{lvl}_map.png"
-                plt.savefig(png_path, dpi=150)
-                plt.close()
-                self.logger.info(f"[DEBUG] Saved: {png_path.name}")
-
-        except Exception as e:
-            self.logger.warning(f"PNG map generation skipped: {e}")
-
-    def _save_diagnostic_traces(
-        self,
-        video_roi: np.ndarray,
-        valid_peaks: np.ndarray,
-        all_peaks: np.ndarray,
-        corners: list,
-        fps: float,
-        metric: str,
-        T: int,
-    ):
-        """Сохраняет диагностические трейсы 4 угловых ROI с разметкой ориентиров в debug/."""
-        try:
-            import matplotlib
-            matplotlib.use("Agg")
-            import matplotlib.pyplot as plt
-
-            fig, axes = plt.subplots(2, 2, figsize=(13, 10))
-            axes = axes.flatten()
-
-            for idx, c in enumerate(corners):
-                cy, cx = c["y"], c["x"]
-                trace = video_roi[:, cy, cx]
-                ax = axes[idx]
-                ax.plot(trace, "k-", label="3×3 ROI Trace", alpha=0.6, linewidth=1.2)
-
-                for b_idx, pk in enumerate(valid_peaks):
-                    pk = int(pk)
-                    global_bi = int(np.where(all_peaks == pk)[0][0])
-                    next_pk = int(all_peaks[global_bi + 1]) if global_bi + 1 < len(all_peaks) else T
-                    seg = trace[pk:next_pk]
-                    if len(seg) < 3:
-                        continue
-
-                    l_peak = pk + int(np.argmax(seg))
-                    l_amp  = float(trace[l_peak])
-                    up_idx, _, _ = find_upstroke_start(trace, l_peak, l_amp, fps)
-                    cross80, found80, _ = find_repol_crossing_with_fallback(
-                        trace, l_peak, l_amp, fps,
-                        threshold=80, next_peak_idx=next_pk, total_frames=T,
-                    )
-
-                    is_first = (b_idx == 0)
-                    if up_idx is not None:
-                        ax.axvline(up_idx, color="g", linestyle=":", alpha=0.4)
-                        ax.plot(up_idx, trace[int(up_idx)], "go", markersize=5,
-                                label="Start (Upstroke)" if is_first else "")
-                    ax.plot(l_peak, trace[l_peak], "ro", markersize=5,
-                            label="Max (Peak)" if is_first else "")
-                    if found80 and cross80 is not None:
-                        ax.axvline(cross80, color="b", linestyle=":", alpha=0.4)
-                        ax.plot(cross80, trace[int(cross80)], "bo", markersize=5,
-                                label="End (Repol80)" if is_first else "")
-
-                ax.set_title(f"Cluster ROI: {c['label']} ({cy}, {cx})", fontsize=10, weight="bold")
-                ax.legend(fontsize=8, loc="upper right")
-                ax.grid(True, alpha=0.2)
-
-            plt.suptitle(
-                f"Diagnostic Traces: {metric} Action Potential Landmark Points",
-                fontsize=13, weight="bold",
-            )
-            plt.tight_layout()
-            png_path = self.debug_dir / "apd_traces.png"
-            plt.savefig(png_path, dpi=150)
-            plt.close()
-            self.logger.info(f"[DEBUG] Saved: apd_traces.png")
-
-        except Exception as e:
-            self.logger.warning(f"Diagnostic trace plot skipped: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Standalone CLI (sys.exit 0/1/2 для оркестратора)
-# ---------------------------------------------------------------------------
-
+# === CLI entry point ===
 if __name__ == "__main__":
     import argparse
-    import sys
+    try:
+        from omegaconf import OmegaConf  # noqa: F401
+    except ImportError:
+        pass
 
-    parser = argparse.ArgumentParser(description="APDAgent standalone — Stage 6")
+    parser = argparse.ArgumentParser(description="APDAgent standalone (v3.7)")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
-    parser.add_argument("--results-root", default="results", help="Results root directory")
-    parser.add_argument("--force", action="store_true", help="Force recompute even if output exists")
+    parser.add_argument("--results-root", default="results")
+    parser.add_argument("--hot-pixel-percentile", type=int, default=50)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-
-    cfg = PipelineConfig({"results_root": args.results_root})
+    cfg = PipelineConfig({
+        "results_root": args.results_root,
+        "apd": {
+            "levels": [30, 50, 80],
+            "hot_pixel_percentile": args.hot_pixel_percentile,
+            "min_amp_abs": 100.0,
+            "min_amp_noise_mult": 3.0,
+        },
+    })
     agent = APDAgent(args.sample_id, config=cfg)
-
-    try:
-        result = agent.run(force=args.force)
-        print(json.dumps(result, indent=2, default=str))
-        sys.exit(0)
-    except ValueError as e:
-        # REJECT — QC не пройден
-        logger.error(f"REJECT: {e}")
-        sys.exit(2)
-    except Exception as e:
-        # CRASH — инфраструктурная ошибка
-        logger.exception(f"CRASH: {e}")
-        sys.exit(1)
+    result = agent.run()
+    print(result)
