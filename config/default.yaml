@@ -88,13 +88,19 @@ alternans:
   sign_floor_ms: 0.5
   discordant_threshold: 0.25
 
-# --- Peak Detector ---
+# --- Peak Detector (v3.6 spec, 2026-07-09) ---
+# Architecture: PeakDetectorAgent is a CONSUMER (Variant A).
+#   - LoaderAgent owns preprocessing (inversion, LPF, normalization).
+#   - PeakDetectorAgent aggregates 1D mean_tissue from preproc + mask
+#     and calls detect_beats(mean_tissue, fps, stim_hz).
+#   - ActivationAgent uses peaks as upstroke 50% crossings (NOT apex).
+#   - APDAgent finds local argmax around each peak for amp/APD.
 peak_detector:
-  spatial_sigma: 2.0        # Gaussian sigma for spatial smoothing (pixels)
-  lp_cutoff_hz: 80.0        # Butterworth low-pass cutoff (Hz)
-  prominence_frac: 0.3      # Min peak prominence as fraction of signal range
-  chunk_size: 8192          # Temporal chunk size for filtering
-  min_peaks: 3              # Minimum peaks required (AG2 gating)
+  sigma_temporal: 3.0          # Gaussian LPF sigma in frames (static, NOT dynamic)
+  threshold_frac: 0.5          # Rising edge at 50% of max amp (upstroke midpoint)
+  min_distance_factor: 0.6     # Min distance between peaks = BCL * 0.6 (frames)
+  drop_first: false            # Do NOT hardcode drop — QC owns startup artifact gate
+  min_peaks: 3                 # Agent gating: raise if n_peaks < 3
 
 # --- QC / Judge ---
 qc:

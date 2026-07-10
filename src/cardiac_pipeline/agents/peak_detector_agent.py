@@ -42,7 +42,9 @@ Architecture:
   - DEPENDS_ON = [LoaderAgent, MaskAgent] — lazy-цепочка даёт preproc_video.npy
   - REQUIRED_INPUTS обновлён: ["preproc_video.npy", "mask.npy", "metadata.json"]
   - Удалён self.sigma, self.lp_cutoff, self.chunk_size (больше не нужны агенту)
-  - Оставлены только detection params: prominence_frac, sigma_temporal, min_peaks
+  - Оставлены только detection params: threshold_frac, sigma_temporal,
+    min_distance_factor, drop_first, min_peaks
+    (v3.6 spec, 2026-07-09: mean_tissue агрегируется в агенте, не в detect_beats)
 """
 
 import json
@@ -88,11 +90,20 @@ class PeakDetectorAgent(BaseAgent):
         super().__init__(sample_id, config)
 
         # Detection params only (preprocessing is LoaderAgent's job)
+        # v3.6 spec (2026-07-09): threshold_frac=0.5, min_distance_factor=0.6,
+        # drop_first=False. prominence_frac deprecated.
         pd_cfg = getattr(self.config, 'peak_detector', {}) or {}
 
-        self.prominence_frac = float(pd_cfg.get('prominence_frac', 0.3))
-        self.sigma_temporal = float(pd_cfg.get('sigma_temporal', 3.0))
-        self.min_peaks      = int(pd_cfg.get('min_peaks',        3))
+        # Accept both new (threshold_frac) and old (prominence_frac) names
+        # for back-compat, but prefer new.
+        if 'threshold_frac' in pd_cfg:
+            self.threshold_frac = float(pd_cfg.get('threshold_frac'))
+        else:
+            self.threshold_frac = float(pd_cfg.get('prominence_frac', 0.5))
+        self.sigma_temporal      = float(pd_cfg.get('sigma_temporal', 3.0))
+        self.min_distance_factor = float(pd_cfg.get('min_distance_factor', 0.6))
+        self.drop_first          = bool(pd_cfg.get('drop_first', False))
+        self.min_peaks           = int(pd_cfg.get('min_peaks', 3))
 
         self.metadata: Dict[str, Any] = {}
 
@@ -126,13 +137,21 @@ class PeakDetectorAgent(BaseAgent):
 
     def _get_stim_hz(self) -> float:
         """
-        stim_hz: приоритет metadata.json > config.stim_hz > 10.0 (documented fallback).
+        stim_hz priority: metadata.stim_hz_effective > metadata.stim_hz >
+                          metadata.pacing_hz > config.stim_hz > 10.0 fallback.
+
+        NOTE (2026-07-09): Some .rsh metadata has stim_hz=500.0 (which is
+        actually fps). stim_hz_effective is the post-pacing-corrected value
+        (e.g. 5.86 for 6Hz pacing) and must be preferred.
         """
+        eff = self.metadata.get("stim_hz_effective")
+        if eff is not None and float(eff) > 0:
+            return float(eff)
         stim = self.metadata.get("stim_hz") or self.metadata.get("pacing_hz")
-        if stim is not None:
+        if stim is not None and float(stim) > 0:
             return float(stim)
         cfg_stim = getattr(self.config, 'stim_hz', None)
-        if cfg_stim is not None:
+        if cfg_stim is not None and float(cfg_stim) > 0:
             return float(cfg_stim)
         self.logger.warning(
             "stim_hz not found in metadata or config — using 10.0 Hz default"
@@ -208,7 +227,23 @@ class PeakDetectorAgent(BaseAgent):
                          f"mask coverage: {mask.mean():.3f}, "
                          f"range=[{preproc_video.min():.1f}, {preproc_video.max():.1f}]")
 
-        # --- 3. Beat detection ---
+        # --- 3. Aggregate mean_tissue (1D) and detect beats ---
+        # CRITICAL: preproc_video is (T, H, W), mask is (H, W) bool.
+        # preproc_video[:, mask] broadcasts to (T, 100, 100) — WRONG.
+        # Correct: reshape to (T, H*W) and apply mask.ravel() → (T, n_mask).
+        # mean(axis=1) over masked pixels only → (T,).
+        T, H, W = preproc_video.shape
+        n_mask = int(mask.sum())
+        if n_mask == 0:
+            raise ValueError(
+                f"Empty mask for sample {self.sample_id}: 0 pixels in tissue. "
+                f"Mask QC failed."
+            )
+        mean_tissue = preproc_video.reshape(T, H * W)[:, mask.ravel()].mean(axis=1)
+        self.logger.info(f"mean_tissue shape: {mean_tissue.shape}, "
+                         f"range=[{mean_tissue.min():.1f}, {mean_tissue.max():.1f}], "
+                         f"mask_n={n_mask}")
+
         if not PEAK_DETECTION_AVAILABLE:
             raise ImportError(
                 "cardiac_pipeline.utils.peak_detection not available. "
@@ -216,15 +251,18 @@ class PeakDetectorAgent(BaseAgent):
             )
 
         self.logger.info(f"Detecting beats (stim_hz={stim_hz}, "
-                         f"prominence_frac={self.prominence_frac}, "
-                         f"sigma_temporal={self.sigma_temporal})")
-        peaks, mean_trace = detect_beats(
-            preproc_video,
-            mask,
+                         f"threshold_frac={self.threshold_frac}, "
+                         f"sigma_temporal={self.sigma_temporal}, "
+                         f"min_distance_factor={self.min_distance_factor}, "
+                         f"drop_first={self.drop_first})")
+        peaks, smoothed = detect_beats(
+            mean_tissue,
             fps=fps,
             stim_hz=stim_hz,
-            prominence_frac=self.prominence_frac,
             sigma_temporal=self.sigma_temporal,
+            threshold_frac=self.threshold_frac,
+            min_distance_factor=self.min_distance_factor,
+            drop_first=self.drop_first,
         )
         n_peaks = int(len(peaks))
         self.logger.info(f"Detected {n_peaks} peaks: {peaks.tolist()}")
@@ -240,18 +278,24 @@ class PeakDetectorAgent(BaseAgent):
         self.save_must(peaks, "peaks.npy")
 
         peak_meta = {
-            "sample_id":        self.sample_id,
-            "fps":              fps,
-            "stim_hz":          stim_hz,
-            "n_peaks":          n_peaks,
-            "prominence_frac":  self.prominence_frac,
-            "sigma_temporal":   self.sigma_temporal,
-            "inverted":         invert,
-            "preprocessing_owner": "LoaderAgent",   # Variant A marker
+            "sample_id":              self.sample_id,
+            "fps":                    fps,
+            "stim_hz":                stim_hz,
+            "n_peaks":                n_peaks,
+            "threshold_frac":         self.threshold_frac,
+            "sigma_temporal":         self.sigma_temporal,
+            "min_distance_factor":    self.min_distance_factor,
+            "drop_first":             self.drop_first,
+            "inverted":               invert,
+            "preprocessing_owner":    "LoaderAgent",   # Variant A marker
         }
         self.save_must(peak_meta, "peak_detection_meta.json")
 
-        self.save_debug(mean_trace, "mean_trace.npy")
+        # Save 1D smoothed trace (debug). Note: this is the smoothed mean
+        # tissue, NOT the preproc_video aggregation (use mean_tissue itself
+        # for raw aggregation).
+        self.save_debug(smoothed, "mean_trace.npy")
+        self.save_debug(mean_tissue, "mean_tissue_raw.npy")
         self.save_debug({
             "min":  float(preproc_video.min()),
             "max":  float(preproc_video.max()),
@@ -294,9 +338,11 @@ if __name__ == "__main__":
     cfg = PipelineConfig({
         "results_root": args.results_root,
         "peak_detector": {
-            "prominence_frac": 0.3,
-            "sigma_temporal":  3.0,
-            "min_peaks":       3,
+            "threshold_frac":      0.5,
+            "sigma_temporal":      3.0,
+            "min_distance_factor": 0.6,
+            "drop_first":          False,
+            "min_peaks":           3,
         },
     })
 
