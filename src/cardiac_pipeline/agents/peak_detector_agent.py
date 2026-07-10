@@ -228,14 +228,34 @@ class PeakDetectorAgent(BaseAgent):
             drop_first=self.drop_first,
         )
 
+        # Synthetic multi-trace-compatible fields (n_regions=1).
+        # ActivationAgent requires peaks_per_region, weights, region_masks
+        # even in single-trace mode. Build them here so downstream stages
+        # don't need to special-case n_regions=1.
+        region_masks_arr = mask[None, ...].astype(np.uint8)  # (1, H, W)
+        ys, xs = np.where(mask)
+        region_centers = np.array([[ys.mean(), xs.mean()]], dtype=np.float32)
+        peaks_per_region = peaks[None, :].astype(np.int64)   # (1, n_peaks)
+        weights = np.ones((H, W, 1), dtype=np.float32)       # (H, W, 1)
+        weights[~mask] = 0.0
+
         return {
-            "peaks_global":      peaks.astype(np.int64),
-            "smoothed":          smoothed,
-            "mean_tissue":       mean_tissue,
+            "peaks_global":       peaks.astype(np.int64),
+            "smoothed":           smoothed,
+            "mean_tissue":        mean_tissue,
             # In single-trace mode, ALL peaks are consensus (1/1 agreement).
             # selected_peaks = all peaks, selected_indices = 0..N-1
-            "selected_peaks":    peaks.astype(np.int64),
-            "selected_indices":  np.arange(len(peaks), dtype=np.int64),
+            "selected_peaks":     peaks.astype(np.int64),
+            "selected_indices":   np.arange(len(peaks), dtype=np.int64),
+            # Synthetic multi-trace fields (n_regions=1)
+            "peaks_per_region":   peaks_per_region,
+            "region_centers":     region_centers,
+            "region_masks":       region_masks_arr,
+            "region_quality":     np.array([1.0], dtype=np.float32),
+            "weights":            weights,
+            "consensus_peaks":    peaks.astype(np.int64),
+            "consensus_agreement": np.ones(len(peaks), dtype=np.float32),
+            "traces_per_region":  mean_tissue[None, ...].astype(np.float32),
         }
 
     # ==================== v3.7 MULTI-TRACE ====================
@@ -523,26 +543,26 @@ class PeakDetectorAgent(BaseAgent):
             "n_regions":              self.n_regions,  # v3.7
         }
 
-        # v3.7 multi-trace outputs
-        if self.n_regions > 1:
-            self.save_must(result["peaks_per_region"], "peaks_per_region.npy")
-            self.save_must(result["region_centers"], "region_centers.npy")
-            self.save_must(result["region_masks"], "region_masks.npy")
-            self.save_must(result["region_quality"], "region_quality.npy")
-            self.save_must(result["weights"], "weights.npy")
-            self.save_must(result["consensus_peaks"], "consensus_peaks.npy")
-            self.save_must(result["consensus_agreement"], "consensus_agreement.npy")
-            self.save_must(result["selected_peaks"], "selected_peaks.npy")
-            self.save_must(result["selected_indices"], "selected_indices.npy")
-            self.save_must(result["traces_per_region"], "traces_per_region.npy")
+        # v3.7 multi-trace outputs (also saved in single-trace mode since
+        # _detect_beats_single_trace now returns synthetic n_regions=1 fields)
+        self.save_must(result["peaks_per_region"], "peaks_per_region.npy")
+        self.save_must(result["region_centers"], "region_centers.npy")
+        self.save_must(result["region_masks"], "region_masks.npy")
+        self.save_must(result["region_quality"], "region_quality.npy")
+        self.save_must(result["weights"], "weights.npy")
+        self.save_must(result["consensus_peaks"], "consensus_peaks.npy")
+        self.save_must(result["consensus_agreement"], "consensus_agreement.npy")
+        self.save_must(result["selected_peaks"], "selected_peaks.npy")
+        self.save_must(result["selected_indices"], "selected_indices.npy")
+        self.save_must(result["traces_per_region"], "traces_per_region.npy")
 
-            peak_meta.update({
-                "n_beats_selected":      int((result["selected_peaks"] >= 0).sum()),
-                "min_agreement":         self.min_agreement,
-                "frame_tolerance":       self.frame_tolerance,
-                "soft_assignment_sigma": self.soft_assignment_sigma,
-                "min_quality":           self.min_quality,
-            })
+        peak_meta.update({
+            "n_beats_selected":      int((result["selected_peaks"] >= 0).sum()),
+            "min_agreement":         self.min_agreement,
+            "frame_tolerance":       self.frame_tolerance,
+            "soft_assignment_sigma": self.soft_assignment_sigma,
+            "min_quality":           self.min_quality,
+        })
 
         self.save_must(peak_meta, "peak_detection_meta.json")
 
