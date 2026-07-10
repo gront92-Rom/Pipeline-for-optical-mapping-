@@ -231,6 +231,22 @@ class APDAgent(BaseAgent):
         self.save_debug(hot_mask, "hot_mask.npy")
         self.save_debug(np.array([min_amp], dtype=np.float32), "min_amp.npy")
 
+        # Save apd_per_beat_3d.npz for AlternansAgent (Stage 7)
+        # Contains APD80 stack (H, W, N_beats) + metric label + n_beats
+        dye = metadata.get("dye") or metadata.get("recording_mode") or "A"
+        d = str(dye).upper().strip()
+        metric = "CaT" if d in ("B", "CALCIUM", "CAT", "CA") else "APD"
+        apd80_idx = self.levels.index(80) if 80 in self.levels else -1
+        if apd80_idx >= 0:
+            apd80_3d = apd_4d[apd80_idx]  # (H, W, n_beats)
+            np.savez_compressed(
+                self.must_dir / "apd_per_beat_3d.npz",
+                apd80=apd80_3d.astype(np.float32),
+                metric=metric,
+                n_beats=n_beats,
+            )
+            self.logger.info(f"[MUST] Saved: apd_per_beat_3d.npz (apd80 {apd80_3d.shape}, metric={metric})")
+
         # Compute summary statistics
         report = {
             "sample_id": self.sample_id,
