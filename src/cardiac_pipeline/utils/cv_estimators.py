@@ -120,7 +120,7 @@ def compute_gradient_angular(
     cv_min: float = _CV_MIN_DEFAULT,
     cv_max: float = _CV_MAX_DEFAULT,
     grad_threshold: float = _GRAD_THRESHOLD_DEFAULT,
-    smooth_sigma: float = 2.0,
+    smooth_sigma: float = 1.5,
     n_bins: int = 18,
     erode_iterations: int = 3,
 ) -> Dict:
