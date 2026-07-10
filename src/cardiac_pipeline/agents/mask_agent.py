@@ -677,6 +677,11 @@ class MaskAgent(BaseAgent):
             metrics.update(fb)
 
         self.save_must(mask.astype(np.uint8), "mask.npy")
+
+        # Save PNG visualization
+        self._save_png(mask.astype(bool))
+        metrics["png"] = "mask.png"
+
         self._log_metrics(metrics)
 
         return {
@@ -684,6 +689,61 @@ class MaskAgent(BaseAgent):
             "method":  metrics.get("method"),
             "metrics": metrics,
         }
+
+    # ==================== VISUALIZATION ====================
+
+    def _save_png(self, mask: np.ndarray) -> None:
+        """Save 2-panel PNG: mean fluorescence image + mask overlay."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            # Mean fluorescence over time axis of the raw (cropped) video
+            if self.raw_video is None:
+                self._load_and_crop_video()
+            video = self.raw_video
+            if video.ndim != 3:
+                # Fallback: single frame
+                self.logger.warning("raw_video not 3D — using as-is for mean image")
+                mean_img = np.asarray(video, dtype=float)
+            else:
+                mean_img = video.astype(float).mean(axis=0)
+
+            # Ensure mask matches mean_img shape
+            if mask.shape != mean_img.shape:
+                self.logger.warning(
+                    f"mask shape {mask.shape} != mean_img shape {mean_img.shape}; "
+                    f"PNG skipped"
+                )
+                return
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+            # Panel 1: raw mean fluorescence
+            ax0 = axes[0]
+            im0 = ax0.imshow(mean_img, cmap="gray", interpolation="nearest")
+            ax0.set_title("Mean Fluorescence", fontsize=13, weight="bold")
+            ax0.axis("off")
+            plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04)
+
+            # Panel 2: mask overlay (semi-transparent color)
+            ax1 = axes[1]
+            ax1.imshow(mean_img, cmap="gray", interpolation="nearest")
+            # Create an RGBA overlay where mask==True
+            overlay = np.zeros((*mask.shape, 4), dtype=float)
+            overlay[mask] = [1.0, 0.0, 0.0, 0.4]  # red, alpha 0.4
+            ax1.imshow(overlay, interpolation="nearest")
+            ax1.set_title("Mask Overlay", fontsize=13, weight="bold")
+            ax1.axis("off")
+
+            plt.tight_layout()
+            path = self.must_dir / "mask.png"
+            plt.savefig(path, dpi=150)
+            plt.close()
+            self.logger.info(f"[MUST] Saved: mask.png")
+        except Exception as e:
+            self.logger.warning(f"mask.png skipped: {e}")
 
 
 if __name__ == "__main__":

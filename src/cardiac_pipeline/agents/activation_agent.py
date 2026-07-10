@@ -242,9 +242,12 @@ class ActivationAgent(BaseAgent):
             "tat_max_ms": round(tat_max, 2),
             "tat_std_ms": round(tat_std, 2),
             "valid_coverage": round(valid_cov, 4),
+            "png": "activation_map.png",
             "elapsed_s": round(elapsed, 3),
         }
         self.save_must(report, "activation_report.json")
+
+        self._save_png(activation_map, mask)
 
         self._log_metrics(report)
         self.logger.info(
@@ -257,6 +260,36 @@ class ActivationAgent(BaseAgent):
             "activation_map_path": "results/{}/must/activation_map.npy".format(self.sample_id),
             "metrics": report,
         }
+
+    # ------------------------------------------------------------------
+    # Visualization
+    # ------------------------------------------------------------------
+
+    def _save_png(self, activation_map: np.ndarray, mask: np.ndarray) -> None:
+        """Save activation map as PNG (jet colormap, masked outside tissue)."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            # Mask non-tissue pixels → NaN for display
+            display = activation_map.astype(float).copy()
+            display[~mask] = np.nan
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            im = ax.imshow(display, cmap="jet", interpolation="nearest")
+            ax.set_title("Activation Time Map", fontsize=13, weight="bold")
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("ms", fontsize=11)
+            ax.axis("off")
+
+            plt.tight_layout()
+            path = self.must_dir / "activation_map.png"
+            plt.savefig(path, dpi=150)
+            plt.close()
+            self.logger.info(f"[MUST] Saved: activation_map.png")
+        except Exception as e:
+            self.logger.warning(f"activation_map.png skipped: {e}")
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ v3.8 (2026-07-10, rewrite):
   - Uses peaks.npy (ALL consensus peaks) — NOT selected_peaks (top-N subset)
   - Single-region mode: no peaks_per_region, no weights, no soft assignment
   - Beat window = peak[i] .. peak[i+1] (last beat extended by BCL)
-  - Hot mask by percentile (default 50 = top 50% std pixels)
+  - Full tissue mask (mask.npy) — NO hot-mask filtering
   - Dynamic min_amp: max(abs_floor, noise_mult * sigma_noise)
   - Outlier rejection: APD > max(BCL*0.9, 300ms) or APD < 10ms
   - Single-pass detection for all levels (30/50/80)
@@ -21,7 +21,7 @@ Outputs (per run):
 
   debug/:
     - apd_4d.npy        (n_levels, H, W, n_beats) — raw per-beat APD
-    - hot_mask.npy      (H, W) bool — pixels included in analysis
+    - mask.npy          (H, W) bool — full tissue mask used in analysis
     - min_amp.npy       float — dynamic threshold used
 """
 from __future__ import annotations
@@ -37,10 +37,8 @@ import numpy as np
 from cardiac_pipeline.base_agent import BaseAgent, PipelineConfig
 from cardiac_pipeline.utils.apd_detector import (
     DEFAULT_LEVELS,
-    DEFAULT_HOT_PIXEL_PERCENTILE,
     DEFAULT_MIN_AMP_ABS,
     DEFAULT_MIN_AMP_NOISE_MULT,
-    compute_hot_mask,
     compute_per_pixel_min_amp,
     detect_all_apd_levels_pixel,
     estimate_noise_sigma,
@@ -69,12 +67,6 @@ class APDAgent(BaseAgent):
             self.levels = list(apd_cfg.levels)
         else:
             self.levels = apd_cfg.get("levels", DEFAULT_LEVELS)
-
-        if hasattr(apd_cfg, "hot_pixel_percentile"):
-            self.hot_pixel_percentile = int(apd_cfg.hot_pixel_percentile)
-        else:
-            self.hot_pixel_percentile = int(apd_cfg.get(
-                "hot_pixel_percentile", DEFAULT_HOT_PIXEL_PERCENTILE))
 
         if hasattr(apd_cfg, "min_amp_abs"):
             self.min_amp_abs = float(apd_cfg.min_amp_abs)
@@ -150,18 +142,16 @@ class APDAgent(BaseAgent):
             f"(outlier threshold={max(bcl_ms*0.9, 300.0):.1f}ms)"
         )
 
-        # === 3. Hot mask ===
-        hot_mask = compute_hot_mask(preproc_video, mask, self.hot_pixel_percentile)
-        active_coords = np.argwhere(hot_mask)  # (N_active, 2)
+        # === 3. Full tissue mask (no hot-mask filtering) ===
+        active_coords = np.argwhere(mask)  # (N_active, 2)
         n_active = len(active_coords)
         self.logger.info(
-            f"[APD] Hot mask: {n_active} active pixels "
-            f"(percentile={self.hot_pixel_percentile}, "
-            f"{n_active/mask.sum()*100:.1f}% of masked)"
+            f"[APD] Full mask: {n_active} active pixels "
+            f"({n_active/mask.size*100:.1f}% of frame)"
         )
 
         if n_active == 0:
-            raise ValueError("[APD] No active pixels — hot mask is empty")
+            raise ValueError("[APD] No active pixels — mask is empty")
 
         # === 4. Noise estimation ===
         sigma_noise = estimate_noise_sigma(preproc_video, mask, fps)
@@ -213,7 +203,7 @@ class APDAgent(BaseAgent):
             self.save_must(apd_map.astype(np.float32), f"apd{lv}_map.npy")
 
         self.save_debug(apd_4d, "apd_4d.npy")
-        self.save_debug(hot_mask, "hot_mask.npy")
+        self.save_debug(mask, "mask.npy")  # full mask used (not hot_mask)
         self.save_debug(np.array([min_amp], dtype=np.float32), "min_amp.npy")
 
         # apd_per_beat_3d.npz for AlternansAgent
@@ -245,7 +235,6 @@ class APDAgent(BaseAgent):
             "n_beats": n_beats,
             "n_windows": n_windows,
             "n_active_pixels": n_active,
-            "hot_pixel_percentile": self.hot_pixel_percentile,
             "sigma_noise": sigma_noise,
             "min_amp": min_amp,
             "min_amp_abs_floor": self.min_amp_abs,
@@ -256,7 +245,7 @@ class APDAgent(BaseAgent):
         }
 
         for lv, apd_map in apd_maps.items():
-            valid = apd_map[hot_mask & np.isfinite(apd_map)]
+            valid = apd_map[mask & np.isfinite(apd_map)]
             if len(valid) > 0:
                 report[f"apd{lv}_median_ms"] = float(np.median(valid))
                 report[f"apd{lv}_iqr_ms"] = [
@@ -264,7 +253,7 @@ class APDAgent(BaseAgent):
                     float(np.percentile(valid, 75)),
                 ]
                 report[f"apd{lv}_n_valid"] = int(len(valid))
-                report[f"apd{lv}_n_detected"] = int((hot_mask & np.isfinite(apd_map)).sum())
+                report[f"apd{lv}_n_detected"] = int((mask & np.isfinite(apd_map)).sum())
             else:
                 report[f"apd{lv}_median_ms"] = None
                 report[f"apd{lv}_iqr_ms"] = None
@@ -272,6 +261,9 @@ class APDAgent(BaseAgent):
                 report[f"apd{lv}_n_detected"] = 0
 
         self.save_must(report, "apd_report.json")
+
+        # PNG visualization (must/apd_maps.png)
+        self._save_png(apd_maps, mask)
 
         self.logger.info(
             f"[APD] Done in {time.time()-t0:.2f}s. "
@@ -290,6 +282,45 @@ class APDAgent(BaseAgent):
         }
 
 
+    # ------------------------------------------------------------------
+    # PNG visualization
+    # ------------------------------------------------------------------
+
+    def _save_png(self, apd_maps: Dict[int, np.ndarray], mask: np.ndarray):
+        """Save APD30/50/80 maps as a 3-panel PNG (must/apd_maps.png)."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            panels = [
+                (apd_maps.get(30), "APD30"),
+                (apd_maps.get(50), "APD50"),
+                (apd_maps.get(80), "APD80"),
+            ]
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            for ax, (amap, title) in zip(axes, panels):
+                if amap is None:
+                    ax.set_title(f"{title} (missing)")
+                    ax.axis("off")
+                    continue
+                masked = amap.astype(float).copy()
+                masked[~mask] = np.nan
+                im = ax.imshow(masked, cmap="hot")
+                ax.set_title(title, fontsize=11)
+                cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label("ms")
+
+            plt.tight_layout()
+            path = self.must_dir / "apd_maps.png"
+            plt.savefig(path, dpi=150)
+            plt.close()
+            self.logger.info(f"[MUST] Saved: apd_maps.png")
+        except Exception as e:
+            self.logger.warning(f"APD maps PNG skipped: {e}")
+
+
 # === CLI entry point ===
 if __name__ == "__main__":
     import argparse
@@ -301,7 +332,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="APDAgent v3.8 — all peaks")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
     parser.add_argument("--results-root", default="results")
-    parser.add_argument("--hot-pixel-percentile", type=int, default=50)
     parser.add_argument("--force", action="store_true", help="Force rerun")
     args = parser.parse_args()
 
@@ -309,7 +339,6 @@ if __name__ == "__main__":
         "results_root": args.results_root,
         "apd": {
             "levels": [30, 50, 80],
-            "hot_pixel_percentile": args.hot_pixel_percentile,
             "min_amp_abs": 100.0,
             "min_amp_noise_mult": 3.0,
         },

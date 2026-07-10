@@ -485,6 +485,9 @@ class ConductionAgent(BaseAgent):
             f"methods={method_dist}"
         )
 
+        # PNG visualization (must/cv_maps.png)
+        self._save_png(cvl_mean, cvt_mean, aniso_mean, mask)
+
         return {
             "status": "success",
             "verdict": verdict,
@@ -496,6 +499,49 @@ class ConductionAgent(BaseAgent):
             "primary_method": primary_method,
             "method_distribution": method_dist,
         }
+
+
+    # ==================== PNG visualization ====================
+
+    def _save_png(
+        self,
+        cvl_map: np.ndarray,
+        cvt_map: np.ndarray,
+        anisotropy_map: np.ndarray,
+        mask: np.ndarray,
+    ):
+        """Save CVL / CVT / Anisotropy maps as a 3-panel PNG (must/cv_maps.png)."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            panels = [
+                (cvl_map,         "jet",      "m/s",   "CVL (Longitudinal)"),
+                (cvt_map,         "jet",      "m/s",   "CVT (Transverse)"),
+                (anisotropy_map,  "coolwarm", "ratio", "Anisotropy Ratio"),
+            ]
+
+            fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+            for ax, (data_map, cmap, cbar_label, title) in zip(axes, panels):
+                if data_map is None:
+                    ax.set_title(f"{title} (missing)")
+                    ax.axis("off")
+                    continue
+                masked = data_map.astype(float).copy()
+                masked[~mask] = np.nan
+                im = ax.imshow(masked, cmap=cmap)
+                ax.set_title(title, fontsize=11)
+                cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label(cbar_label)
+
+            plt.tight_layout()
+            path = self.must_dir / "cv_maps.png"
+            plt.savefig(path, dpi=150)
+            plt.close()
+            self.logger.info(f"[MUST] Saved: cv_maps.png")
+        except Exception as e:
+            self.logger.warning(f"CV maps PNG skipped: {e}")
 
 
 # ---------------------------------------------------------------------------
