@@ -229,9 +229,13 @@ class PeakDetectorAgent(BaseAgent):
         )
 
         return {
-            "peaks_global": peaks.astype(np.int64),
-            "smoothed": smoothed,
-            "mean_tissue": mean_tissue,
+            "peaks_global":      peaks.astype(np.int64),
+            "smoothed":          smoothed,
+            "mean_tissue":       mean_tissue,
+            # In single-trace mode, ALL peaks are consensus (1/1 agreement).
+            # selected_peaks = all peaks, selected_indices = 0..N-1
+            "selected_peaks":    peaks.astype(np.int64),
+            "selected_indices":  np.arange(len(peaks), dtype=np.int64),
         }
 
     # ==================== v3.7 MULTI-TRACE ====================
@@ -367,19 +371,22 @@ class PeakDetectorAgent(BaseAgent):
             f"sum-to-1 check: {weights.sum(axis=2).mean():.4f}"
         )
 
-        # 6. Select top-N beats by quality (for downstream APD)
+        # 6. Select ALL consensus beats (not just top-N) for downstream stages.
+        # n_beats_select limits APD quality ranking internally, but selected_peaks
+        # must carry all valid beats so AlternansAgent (Stage 7) has enough data.
+        n_consensus = len(consensus)
         selected_peaks, selected_indices = select_top_beats(
             consensus,
             agreement,
-            n_beats=self.n_beats_select,
+            n_beats=n_consensus,  # ALL consensus beats, not just top-N
             min_quality=self.min_quality,
-            sort_by="agreement",
+            sort_by="temporal",    # preserve temporal order
         )
-        # Pad selected_peaks to fixed length (n_beats_select) for shape stability
-        if len(selected_peaks) < self.n_beats_select:
-            pad = np.full(self.n_beats_select - len(selected_peaks), -1, dtype=np.int64)
+        # Pad selected_peaks to n_consensus length for shape stability
+        if len(selected_peaks) < n_consensus:
+            pad = np.full(n_consensus - len(selected_peaks), -1, dtype=np.int64)
             selected_peaks = np.concatenate([selected_peaks, pad])
-            pad_idx = np.full(self.n_beats_select - len(selected_indices), -1, dtype=np.int64)
+            pad_idx = np.full(n_consensus - len(selected_indices), -1, dtype=np.int64)
             selected_indices = np.concatenate([selected_indices, pad_idx])
 
         self.logger.info(
@@ -493,7 +500,14 @@ class PeakDetectorAgent(BaseAgent):
             )
 
         # --- 5. Save artifacts ---
-        self.save_must(peaks_global, "peaks.npy")  # consensus peaks
+        self.save_must(peaks_global, "peaks.npy")
+
+        # selected_peaks: ALL consensus beats (both single and multi-trace modes).
+        # AlternansAgent (Stage 7) needs all beats — n_beats_select does NOT limit this.
+        if "selected_peaks" in result:
+            self.save_must(result["selected_peaks"], "selected_peaks.npy")
+        if "selected_indices" in result:
+            self.save_must(result["selected_indices"], "selected_indices.npy")
 
         peak_meta = {
             "sample_id":              self.sample_id,

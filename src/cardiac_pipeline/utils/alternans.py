@@ -20,6 +20,7 @@ alternans.py — Математическое ядро анализа альте
 """
 
 import logging
+import warnings
 from typing import Optional, Tuple
 
 import numpy as np
@@ -63,20 +64,24 @@ def compute_spatial_alternans(
     diffs      = apd3d[..., 1:] - apd3d[..., :-1]
     mean_pairs = (apd3d[..., 1:] + apd3d[..., :-1]) / 2.0
 
-    # Амплитуда в мс
-    ac_ms = np.nanmean(np.abs(diffs) / 2.0, axis=-1).astype(np.float32)
+    # All-NaN slices produce RuntimeWarning from np.nanmean — suppress (NaN is correct)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Mean of empty slice")
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered")
+        with np.errstate(invalid="ignore", divide="ignore"):
+            # Амплитуда в мс
+            ac_ms = np.nanmean(np.abs(diffs) / 2.0, axis=-1).astype(np.float32)
 
-    # Амплитуда в %
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ac_pct = np.nanmean(
-            (np.abs(diffs) / mean_pairs) * 100.0, axis=-1
-        ).astype(np.float32)
+            # Амплитуда в %
+            ac_pct = np.nanmean(
+                (np.abs(diffs) / mean_pairs) * 100.0, axis=-1
+            ).astype(np.float32)
 
-    # Карта фазы
-    phase_map = np.sign(np.nanmean(diffs, axis=-1)).astype(np.float32)
+            # Карта фазы
+            phase_map = np.sign(np.nanmean(diffs, axis=-1)).astype(np.float32)
 
-    # Зануляем шумовые пиксели и фон
-    mean_abs_diff = np.nanmean(np.abs(diffs), axis=-1)
+            # Зануляем шумовые пиксели и фон
+            mean_abs_diff = np.nanmean(np.abs(diffs), axis=-1)
     phase_map[mean_abs_diff < sign_floor_ms] = np.nan
     phase_map[~mask] = np.nan
 
