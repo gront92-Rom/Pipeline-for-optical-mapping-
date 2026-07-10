@@ -2,13 +2,14 @@
 """
 ConductionAgent — Conduction Velocity Analysis Agent (Stage: CV)
 
-Рассчитывает карту скорости проведения (CV) по per-beat картам активации,
-используя консенсус двух независимых методов:
-  1. compute_hybrid_structure_tensor — прямой градиент (быстро, точно при высоком SNR)
-  2. compute_polynomial_bayly       — Гаусс-сглаженный градиент (устойчив к шуму)
+Рассчитывает карту скорости проведения (CV) по per-beat картам активации.
 
-Консенсус: пиксель принимается только если оба метода согласуются в пределах
-tolerance (15% по умолчанию). Итоговые карты — nanmean и nanstd по битам.
+Стратегия: «Всегда считать оба метода»
+  Для каждого бита:
+    1. compute_gradient_angular() — primary (gradient + angular histogram)
+    2. compute_structure_tensor()  — fallback (structure tensor eigenvectors)
+    3. select_best_cv_result()     — выбирает лучший по valid_fraction / n_valid
+    4. Результат победителя идёт в агрегацию
 
 Inputs (lazy — запускает ActivationAgent если нужно):
   - must/per_beat_activation.npy   (from ActivationAgent, shape: [N, H, W], мс)
@@ -17,33 +18,29 @@ Inputs (lazy — запускает ActivationAgent если нужно):
 
 Outputs:
   MUST:
-    - cv_mean.npy           — средняя карта CV по битам (м/с)
-    - cv_sd.npy             — стандартное отклонение CV по битам (м/с)
+    - cv_mean.npy           — средняя карта CV (м/с)
+    - cv_sd.npy             — SD CV по битам (м/с)
     - cv_angles.npy         — медианная карта направлений (рад)
-    - conduction_report.json — вердикт, метрики, параметры
+    - cv_vx.npy, cv_vy.npy  — векторное поле (направление, нормированное)
+    - cvl_map.npy           — карта продольной CV (м/с) [from ST when available]
+    - cvt_map.npy           — карта трансверсальной CV (м/с) [from ST when available]
+    - anisotropy_map.npy    — карта анизотропии [from ST when available]
+    - fiber_angle_map.npy   — карта направления волокон (рад)
+    - coherence_map.npy     — карта когерентности
+    - conduction_report.json — вердикт, метрики, метод distribution
   DEBUG:
     - cv_per_beat.npy       — CV для каждого бита [N, H, W]
-    - cv_coherence.npy      — медианная карта когерентности
-    - conduction_debug.json — детали QC по каждому биту
-
-Исправления относительно кора (2026-07-02):
-  - F5 fix: cv_method_local_fit не импортируется (не существует в conduction_analysis)
-  - CV2 fix: pixel_size_mm берётся из metadata.json, без хардкода и дефолта
-  - CV4 fix: добавлен judge_conduction() с единым QC и физиологическими границами из конфига
-  - CV5 fix: абсолютных путей нет — все пути через self.get_path() / BaseAgent API
-  - C1 fix: fps не используется в CV-расчёте (карта активации уже в мс)
-  - C2 fix: NaN-CV → REJECT, не тихий SUCCESS
-  - SC1 fix: всегда ненулевой exit при REJECT (raise ValueError)
-  - SC6 fix: маска берётся только из must/ текущего sample_id
-  - SC7 fix: NaN вне маски заполняются до градиента, но результат маскируется обратно
-  - np.warnings (deprecated) → warnings.catch_warnings
-  - process() → run(force=False) (BaseAgent API)
-  - update_status() → raise ValueError / return dict (BaseAgent API)
+    - cvl_per_beat.npy      — CVL для каждого бита
+    - cvt_per_beat.npy      — CVT для каждого бита
+    - anisotropy_per_beat.npy
+    - cv_vs_angle.npy       — angular distribution CV
+    - conduction_debug.json — детали QC + оба метода по каждому биту
 """
 
 import json
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -51,8 +48,9 @@ import numpy as np
 
 from cardiac_pipeline.base_agent import BaseAgent, PipelineConfig
 from cardiac_pipeline.utils.cv_estimators import (
-    compute_hybrid_structure_tensor,
-    compute_polynomial_bayly,
+    compute_gradient_angular,
+    compute_structure_tensor,
+    select_best_cv_result,
     estimate_cv_stats,
 )
 
@@ -66,20 +64,9 @@ def judge_conduction(
     mask: np.ndarray,
     cv_min: float,
     cv_max: float,
-    qc_threshold: float = 0.20,
+    qc_threshold: float = 0.15,
 ) -> Tuple[str, str, Dict[str, Any]]:
-    """
-    Оценивает качество карты CV.
-
-    Возвращает (verdict, reason, metrics).
-    verdict: PASS / WARN / REJECT
-
-    Правила:
-      REJECT — нет ни одного валидного пикселя в маске
-      REJECT — valid_fraction < qc_threshold
-      WARN   — valid_fraction < 0.5
-      PASS   — valid_fraction >= 0.5
-    """
+    """Оценивает качество карты CV. Возвращает (verdict, reason, metrics)."""
     if cv_mean is None or not mask.any():
         return "REJECT", "empty cv_mean or empty mask", {}
 
@@ -87,7 +74,7 @@ def judge_conduction(
     metrics: Dict[str, Any] = {**stats}
     metrics["cv_min_config"] = cv_min
     metrics["cv_max_config"] = cv_max
-    metrics["qc_threshold"]  = qc_threshold
+    metrics["qc_threshold"] = qc_threshold
 
     valid_fraction = stats["valid_fraction"]
 
@@ -95,20 +82,26 @@ def judge_conduction(
         return "REJECT", "all CV pixels are NaN", metrics
 
     if valid_fraction < qc_threshold:
-        return (
-            "REJECT",
-            f"valid_fraction={valid_fraction:.3f} < qc_threshold={qc_threshold:.2f}",
-            metrics,
-        )
+        return "REJECT", f"valid_fraction={valid_fraction:.3f} < qc_threshold={qc_threshold:.2f}", metrics
 
     if valid_fraction < 0.5:
-        return (
-            "WARN",
-            f"valid_fraction={valid_fraction:.3f} < 0.5 (low coverage)",
-            metrics,
-        )
+        return "WARN", f"valid_fraction={valid_fraction:.3f} < 0.5 (low coverage)", metrics
 
     return "PASS", "OK", metrics
+
+
+def classify_phenotype(cvl: float, anisotropy: float) -> str:
+    """Классификация фенотипа проведения."""
+    if np.isnan(cvl):
+        return "unknown"
+    if cvl < 0.2:
+        return "slowed"
+    if np.isfinite(anisotropy):
+        if anisotropy > 4.0:
+            return "fibrotic"
+        if anisotropy < 1.4:
+            return "disorganized"
+    return "normal"
 
 
 # ---------------------------------------------------------------------------
@@ -117,13 +110,10 @@ def judge_conduction(
 
 class ConductionAgent(BaseAgent):
     """
-    ConductionAgent — рассчитывает карту скорости проведения (CV).
-
-    Консенсус двух методов (hybrid_structure_tensor + polynomial_bayly)
-    по каждому биту → nanmean / nanstd по битам.
+    ConductionAgent — всегда считает оба метода, выбирает лучший per-beat.
     """
 
-    DEPENDS_ON: list = []  # [ActivationAgent] — установлен ниже (lazy import)
+    DEPENDS_ON: list = []
     REQUIRED_INPUTS: list = ["per_beat_activation.npy", "mask.npy"]
 
     def __init__(self, sample_id: str, config: Optional[PipelineConfig] = None):
@@ -131,18 +121,23 @@ class ConductionAgent(BaseAgent):
 
         cv_cfg = getattr(self.config, "conduction", {}) or {}
 
-        # Допустимая относительная разница между методами для консенсуса
-        self.tolerance: float = float(cv_cfg.get("tolerance", 0.15))
-
-        # Физиологические границы CV (м/с = мм/мс)
         self.cv_min: float = float(cv_cfg.get("cv_min_m_per_s", 0.05))
         self.cv_max: float = float(cv_cfg.get("cv_max_m_per_s", 2.0))
+        self.qc_threshold: float = float(cv_cfg.get("qc_threshold", 0.15))
 
-        # Минимальная доля ткани с валидным CV для PASS
-        self.qc_threshold: float = float(cv_cfg.get("qc_threshold", 0.20))
+        # Gradient params
+        self.grad_threshold: float = float(cv_cfg.get("grad_threshold", 0.5))
+        self.smooth_sigma: float = float(cv_cfg.get("smooth_sigma", 2.0))
+        self.n_bins: int = int(cv_cfg.get("n_angle_bins", 18))
 
-        # Параметр сглаживания для метода Бейли (пикселей)
-        self.window_size: float = float(cv_cfg.get("integration_sigma", 4.0))
+        # ST params
+        self.st_local_sigma: float = float(cv_cfg.get("st_local_sigma", 2.0))
+        self.st_integration_sigma: float = float(cv_cfg.get("st_integration_sigma", 4.0))
+
+        # Selection params
+        self.min_valid: int = int(cv_cfg.get("min_valid", 50))
+        self.valid_frac_margin: float = float(cv_cfg.get("valid_frac_margin", 0.08))
+        self.n_valid_ratio: float = float(cv_cfg.get("n_valid_ratio", 1.20))
 
         self.metadata: Dict[str, Any] = {}
 
@@ -159,266 +154,347 @@ class ConductionAgent(BaseAgent):
         return self.metadata
 
     def _get_pixel_size_mm(self) -> float:
-        """
-        Извлекает pixel_size_mm из metadata.json.
-
-        CV2 fix: нет хардкода 0.85, нет молчаливого дефолта.
-        REJECT если отсутствует или <= 0.
-        """
         px = self.metadata.get("pixel_size_mm")
         if px is None:
-            raise ValueError(
-                "pixel_size_mm отсутствует в metadata.json. "
-                "LoaderAgent должен сохранить его заранее."
-            )
+            raise ValueError("pixel_size_mm отсутствует в metadata.json")
         px = float(px)
         if px <= 0:
-            raise ValueError(
-                f"pixel_size_mm некорректен (pixel_size_mm={px}). "
-                "Проверьте metadata.json."
-            )
+            raise ValueError(f"pixel_size_mm некорректен ({px})")
         return px
 
-    # ==================== CONSENSUS COMPUTATION ====================
+    # ==================== COMPUTATION ====================
 
     def _compute_beat_cv(
         self,
         beat_map: np.ndarray,
         mask: np.ndarray,
         pixel_size_mm: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Dict:
         """
-        Консенсус CV для одного бита.
+        CV для одного бита — всегда оба метода + select_best.
 
-        Возвращает (cv_consensus, angles_m1, coherence_m1).
-        Пиксели, где методы расходятся > tolerance, → NaN.
+        Возвращает dict:
+          primary, grad_res, st_res, method, selection_reason,
+          grad_n_valid, st_n_valid, grad_valid_fraction, st_valid_fraction
         """
-        cv1, ang1, coh1 = compute_hybrid_structure_tensor(
+        # 1. Gradient angular (always)
+        grad_res = compute_gradient_angular(
             beat_map, mask, pixel_size_mm,
             cv_min=self.cv_min, cv_max=self.cv_max,
+            grad_threshold=self.grad_threshold,
+            smooth_sigma=self.smooth_sigma,
+            n_bins=self.n_bins,
         )
-        cv2, _ang2, _coh2 = compute_polynomial_bayly(
+
+        # 2. Structure tensor (always)
+        st_res = compute_structure_tensor(
             beat_map, mask, pixel_size_mm,
-            window_size=self.window_size,
             cv_min=self.cv_min, cv_max=self.cv_max,
+            local_sigma=self.st_local_sigma,
+            integration_sigma=self.st_integration_sigma,
         )
 
-        # Консенсус: относительная разница <= tolerance
-        max_cv = np.fmax(cv1, cv2)  # fmax игнорирует NaN
-        with np.errstate(divide="ignore", invalid="ignore"):
-            rel_diff = np.abs(cv1 - cv2) / (max_cv + 1e-9)
-
-        consensus_mask = (
-            mask
-            & np.isfinite(cv1)
-            & np.isfinite(cv2)
-            & (rel_diff <= self.tolerance)
+        # 3. Select best
+        selection = select_best_cv_result(
+            grad_res, st_res, mask,
+            min_valid=self.min_valid,
+            valid_frac_margin=self.valid_frac_margin,
+            n_valid_ratio=self.n_valid_ratio,
         )
 
-        cv_consensus = np.where(consensus_mask, (cv1 + cv2) / 2.0, np.nan)
+        return {
+            "primary": selection["result"],
+            "grad_res": grad_res,
+            "st_res": st_res,
+            "method": selection["method"],
+            "selection_reason": selection["selection_reason"],
+            "grad_n_valid": selection["grad_n_valid"],
+            "st_n_valid": selection["st_n_valid"],
+            "grad_valid_fraction": selection["grad_valid_fraction"],
+            "st_valid_fraction": selection["st_valid_fraction"],
+        }
 
-        return cv_consensus, ang1, coh1
-
-    def _compute_consensus_cv(
+    def _compute_all_beats(
         self,
         per_beat_activation: np.ndarray,
         mask: np.ndarray,
         pixel_size_mm: float,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Dict]]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+               np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+               np.ndarray, List[Dict]]:
         """
-        Расчёт консенсусного CV по всем битам.
+        Расчёт CV по всем битам. Всегда оба метода + select_best per beat.
 
         Возвращает:
-          cv_mean    — nanmean по битам (H, W)
-          cv_sd      — nanstd по битам  (H, W)
-          cv_angles  — nanmedian углов  (H, W)
-          cv_coherence — nanmedian когерентности (H, W)
-          beat_stats — список dict с QC по каждому биту
+          cv_mean, cv_sd, cv_angles, cv_vx, cv_vy,
+          cvl_mean, cvt_mean, aniso_mean,
+          fiber_angle_mean, coherence_mean,
+          cv_vs_angle_mean,
+          beat_stats
         """
         n_beats = per_beat_activation.shape[0]
         H, W = mask.shape
 
+        # TAT info (for logging)
+        all_act = per_beat_activation[:, mask] if mask.any() else np.array([[0]])
+        tat = float(np.nanmax(all_act[np.isfinite(all_act)]) - np.nanmin(all_act[np.isfinite(all_act)])) if np.any(np.isfinite(all_act)) else 0.0
+        self.logger.info(f"TAT={tat:.1f}ms — computing both methods for all {n_beats} beats")
+
         beats_cv: List[np.ndarray] = []
-        beats_ang: List[np.ndarray] = []
+        beats_cvl: List[np.ndarray] = []
+        beats_cvt: List[np.ndarray] = []
+        beats_aniso: List[np.ndarray] = []
+        beats_angle: List[np.ndarray] = []
         beats_coh: List[np.ndarray] = []
+        beats_vx: List[np.ndarray] = []
+        beats_vy: List[np.ndarray] = []
+        cv_vs_angles: List[np.ndarray] = []
         beat_stats: List[Dict] = []
+        methods_used: List[str] = []
 
         for i in range(n_beats):
             beat_map = per_beat_activation[i]
 
-            # Пропускаем бит если карта пустая
             if not np.any(np.isfinite(beat_map[mask])):
-                self.logger.warning(f"Beat {i}: activation map is all-NaN, skipping")
-                beat_stats.append({"beat": i, "skipped": True, "reason": "all-NaN activation"})
+                self.logger.warning(f"Beat {i}: all-NaN activation, skipping")
+                beat_stats.append({"beat": i, "skipped": True, "reason": "all-NaN"})
                 continue
 
             try:
-                cv_b, ang_b, coh_b = self._compute_beat_cv(beat_map, mask, pixel_size_mm)
+                beat_cv = self._compute_beat_cv(beat_map, mask, pixel_size_mm)
             except Exception as exc:
-                self.logger.warning(f"Beat {i}: CV computation failed — {exc}")
+                self.logger.warning(f"Beat {i}: CV failed — {exc}")
                 beat_stats.append({"beat": i, "skipped": True, "reason": str(exc)})
                 continue
 
-            stats_b = estimate_cv_stats(cv_b, mask)
+            primary = beat_cv["primary"]
+            method = beat_cv["method"]
+            reason = beat_cv["selection_reason"]
+            methods_used.append(method)
+
+            stats_b = estimate_cv_stats(primary["cv_map"], mask)
+
             beat_stats.append({
                 "beat": i,
                 "skipped": False,
+                "method": method,
+                "selection_reason": reason,
                 **stats_b,
+                "cvl_m_s": primary["cvl_m_s"],
+                "cvt_m_s": primary["cvt_m_s"],
+                "anisotropy_ratio": primary["anisotropy_ratio"],
+                "fiber_angle_deg": primary["fiber_angle_deg"],
+                "fiber_coherence": primary["fiber_coherence"],
+                "n_sources": primary["n_sources"],
+                "n_valid": primary["n_valid"],
+                "grad_n_valid": beat_cv["grad_n_valid"],
+                "st_n_valid": beat_cv["st_n_valid"],
+                "grad_valid_fraction": beat_cv["grad_valid_fraction"],
+                "st_valid_fraction": beat_cv["st_valid_fraction"],
             })
+
             self.logger.info(
-                f"Beat {i}: valid_fraction={stats_b['valid_fraction']:.3f}, "
-                f"cv_median={stats_b['cv_median_m_per_s']} m/s"
+                f"Beat {i}: method={method} ({reason}), "
+                f"valid={stats_b['valid_fraction']:.3f}, "
+                f"cv_median={stats_b['cv_median_m_per_s']}, "
+                f"CVL={primary['cvl_m_s']:.3f}, CVT={primary['cvt_m_s']:.3f}, "
+                f"aniso={primary['anisotropy_ratio']:.2f} | "
+                f"grad_n={beat_cv['grad_n_valid']}, st_n={beat_cv['st_n_valid']}"
             )
 
-            beats_cv.append(cv_b)
-            beats_ang.append(ang_b)
-            beats_coh.append(coh_b)
+            beats_cv.append(primary["cv_map"])
+            beats_cvl.append(primary["cvl_map"])
+            beats_cvt.append(primary["cvt_map"])
+            beats_aniso.append(primary["anisotropy_map"])
+            beats_angle.append(primary["fiber_angle_map"])
+            beats_coh.append(primary["coherence_map"])
+            beats_vx.append(primary["vx"])
+            beats_vy.append(primary["vy"])
+            if "cv_vs_angle" in primary and np.isfinite(primary["cv_vs_angle"]).any():
+                cv_vs_angles.append(primary["cv_vs_angle"])
 
         if len(beats_cv) == 0:
-            nan_map = np.full((H, W), np.nan)
-            return nan_map, nan_map.copy(), nan_map.copy(), nan_map.copy(), beat_stats
-
-        beats_cv_arr = np.array(beats_cv)   # [N_valid, H, W]
-        beats_ang_arr = np.array(beats_ang)
-        beats_coh_arr = np.array(beats_coh)
+            nan = np.full((H, W), np.nan)
+            return (nan, nan.copy(), nan.copy(), nan.copy(), nan.copy(),
+                    nan.copy(), nan.copy(), nan.copy(), nan.copy(), nan.copy(),
+                    np.full(self.n_bins, np.nan), beat_stats)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            cv_mean = np.nanmean(beats_cv_arr, axis=0)
-            cv_sd   = np.nanstd(beats_cv_arr, axis=0)
-            cv_angles  = np.nanmedian(beats_ang_arr, axis=0)
-            cv_coherence = np.nanmedian(beats_coh_arr, axis=0)
+            cv_mean = np.nanmean(np.array(beats_cv), axis=0)
+            cv_sd = np.nanstd(np.array(beats_cv), axis=0)
+            cvl_mean = np.nanmean(np.array(beats_cvl), axis=0)
+            cvt_mean = np.nanmean(np.array(beats_cvt), axis=0)
+            aniso_mean = np.nanmean(np.array(beats_aniso), axis=0)
+            angle_mean = np.nanmedian(np.array(beats_angle), axis=0)
+            coh_mean = np.nanmedian(np.array(beats_coh), axis=0)
+            vx_mean = np.nanmean(np.array(beats_vx), axis=0)
+            vy_mean = np.nanmean(np.array(beats_vy), axis=0)
+            cv_vs_angle_mean = np.nanmean(np.array(cv_vs_angles), axis=0) if cv_vs_angles else np.full(self.n_bins, np.nan)
 
-        # Маскируем вне ткани
-        cv_mean  = np.where(mask, cv_mean, np.nan)
-        cv_sd    = np.where(mask, cv_sd,   np.nan)
-        cv_angles = np.where(mask, cv_angles, np.nan)
-        cv_coherence = np.where(mask, cv_coherence, np.nan)
+        # Mask
+        for arr in [cv_mean, cv_sd, cvl_mean, cvt_mean, aniso_mean,
+                    angle_mean, coh_mean, vx_mean, vy_mean]:
+            arr[~mask] = np.nan
 
-        return cv_mean, cv_sd, cv_angles, cv_coherence, beat_stats
+        # Store methods for report
+        self._methods_used = methods_used
+
+        # Store per-beat arrays for DEBUG saving in run()
+        self._beats_cv = beats_cv
+        self._beats_cvl = beats_cvl
+        self._beats_cvt = beats_cvt
+        self._beats_aniso = beats_aniso
+
+        return (cv_mean, cv_sd, angle_mean, vx_mean, vy_mean,
+                cvl_mean, cvt_mean, aniso_mean, angle_mean, coh_mean,
+                cv_vs_angle_mean, beat_stats)
 
     # ==================== RUN ====================
 
     def run(self, force: bool = False, **kwargs) -> Dict[str, Any]:
-        """
-        Главный метод агента.
-
-        Шаги:
-          1. Lazy-запуск ActivationAgent если нужно
-          2. Загрузка metadata.json → pixel_size_mm (REJECT если нет)
-          3. Загрузка mask.npy + per_beat_activation.npy
-          4. Расчёт консенсусного CV по битам
-          5. QC / judge → REJECT если valid_fraction < qc_threshold
-          6. Сохранение артефактов (MUST + DEBUG)
-          7. Возврат report dict
-        """
         if not force and self.exists("cv_mean.npy"):
-            self.logger.info("cv_mean.npy exists, skipping (use force=True to recompute)")
+            self.logger.info("cv_mean.npy exists, skipping (use force=True)")
             return {"status": "skipped"}
 
         t0 = time.perf_counter()
 
-        # --- Lazy: запускаем Activation (→ PeakDetector → Loader → Mask) ---
+        # Lazy dependencies
         from cardiac_pipeline.agents.activation_agent import ActivationAgent
         self.DEPENDS_ON = [ActivationAgent]
         self.ensure_dependencies(force=force)
 
-        # --- 2. Metadata ---
+        # Metadata
         self._load_metadata()
         pixel_size_mm = self._get_pixel_size_mm()
 
-        # --- 3. Load inputs ---
+        # Load inputs
         mask = self.load_must("mask.npy").astype(bool)
         per_beat_activation = self.load_must("per_beat_activation.npy")
 
-        # Нормализуем форму: если 2D (один бит) → добавляем ось
         if per_beat_activation.ndim == 2:
             per_beat_activation = per_beat_activation[np.newaxis, ...]
 
         n_beats, H, W = per_beat_activation.shape
-        self.logger.info(
-            f"Loaded: mask={mask.shape}, per_beat_activation={per_beat_activation.shape}, "
-            f"pixel_size_mm={pixel_size_mm}"
-        )
+        self.logger.info(f"Loaded: mask={mask.shape}, activation={per_beat_activation.shape}, px={pixel_size_mm}")
 
         if n_beats == 0:
-            raise ValueError("per_beat_activation.npy содержит 0 битов.")
+            raise ValueError("per_beat_activation.npy: 0 beats")
 
-        # --- 4. Расчёт CV ---
-        self.logger.info(
-            f"Computing consensus CV: {n_beats} beats, "
-            f"tolerance={self.tolerance}, cv_range=[{self.cv_min}, {self.cv_max}] m/s"
-        )
-        cv_mean, cv_sd, cv_angles, cv_coherence, beat_stats = self._compute_consensus_cv(
+        # Compute
+        (cv_mean, cv_sd, cv_angles, cv_vx, cv_vy,
+         cvl_mean, cvt_mean, aniso_mean, fiber_angle_mean, coh_mean,
+         cv_vs_angle_mean, beat_stats) = self._compute_all_beats(
             per_beat_activation, mask, pixel_size_mm
         )
 
-        # --- 5. QC ---
+        # QC
         verdict, reason, metrics = judge_conduction(
-            cv_mean, mask,
-            cv_min=self.cv_min,
-            cv_max=self.cv_max,
+            cv_mean, mask, cv_min=self.cv_min, cv_max=self.cv_max,
             qc_threshold=self.qc_threshold,
         )
-        self.logger.info(f"QC verdict: {verdict} — {reason}")
+        self.logger.info(f"QC: {verdict} — {reason}")
 
         if verdict == "REJECT":
-            # C2 fix: REJECT → raise, не тихий exit 0
-            raise ValueError(
-                f"ConductionAgent REJECT: {reason}. "
-                f"Sample {self.sample_id} requires manual review."
-            )
+            raise ValueError(f"ConductionAgent REJECT: {reason}. Sample {self.sample_id} needs manual review.")
 
-        # --- 6. Сохранение ---
-        # MUST
-        self.save_must(cv_mean,   "cv_mean.npy")
-        self.save_must(cv_sd,     "cv_sd.npy")
+        # Aggregate scalars
+        valid_beats = [b for b in beat_stats if not b.get("skipped", False)]
+        cvl_scalar = float(np.nanmedian([b.get("cvl_m_s", np.nan) for b in valid_beats])) if valid_beats else np.nan
+        cvt_scalar = float(np.nanmedian([b.get("cvt_m_s", np.nan) for b in valid_beats])) if valid_beats else np.nan
+        aniso_scalar = float(np.nanmedian([b.get("anisotropy_ratio", np.nan) for b in valid_beats])) if valid_beats else np.nan
+        angle_scalar = float(np.nanmedian([b.get("fiber_angle_deg", np.nan) for b in valid_beats])) if valid_beats else np.nan
+        coher_scalar = float(np.nanmedian([b.get("fiber_coherence", np.nan) for b in valid_beats])) if valid_beats else np.nan
+        n_sources_total = int(np.nansum([b.get("n_sources", 0) for b in valid_beats])) if valid_beats else 0
+        phenotype = classify_phenotype(cvl_scalar, aniso_scalar)
+
+        # Method distribution
+        method_counts = Counter(self._methods_used) if hasattr(self, '_methods_used') else Counter()
+        method_dist = dict(method_counts)
+        primary_method = method_counts.most_common(1)[0][0] if method_counts else "unknown"
+
+        # Average valid fractions per method
+        grad_fracs = [b.get("grad_valid_fraction", np.nan) for b in valid_beats]
+        st_fracs = [b.get("st_valid_fraction", np.nan) for b in valid_beats]
+        avg_grad_frac = float(np.nanmean(grad_fracs)) if grad_fracs else np.nan
+        avg_st_frac = float(np.nanmean(st_fracs)) if st_fracs else np.nan
+
+        # Save MUST
+        self.save_must(cv_mean, "cv_mean.npy")
+        self.save_must(cv_sd, "cv_sd.npy")
         self.save_must(cv_angles, "cv_angles.npy")
+        self.save_must(cv_vx, "cv_vx.npy")
+        self.save_must(cv_vy, "cv_vy.npy")
+        self.save_must(cvl_mean, "cvl_map.npy")
+        self.save_must(cvt_mean, "cvt_map.npy")
+        self.save_must(aniso_mean, "anisotropy_map.npy")
+        self.save_must(fiber_angle_mean, "fiber_angle_map.npy")
+        self.save_must(coh_mean, "coherence_map.npy")
 
         elapsed = round(time.perf_counter() - t0, 2)
 
         report = {
-            "sample_id":      self.sample_id,
-            "pixel_size_mm":  pixel_size_mm,
-            "n_beats_input":  n_beats,
-            "n_beats_used":   sum(1 for b in beat_stats if not b.get("skipped", False)),
-            "tolerance":      self.tolerance,
-            "cv_min_m_per_s": self.cv_min,
-            "cv_max_m_per_s": self.cv_max,
-            "qc_threshold":   self.qc_threshold,
-            "verdict":        verdict,
-            "reason":         reason,
-            "metrics":        metrics,
-            "elapsed_s":      elapsed,
+            "sample_id": self.sample_id,
+            "pixel_size_mm": pixel_size_mm,
+            "n_beats_input": n_beats,
+            "n_beats_used": len(valid_beats),
+            "verdict": verdict,
+            "reason": reason,
+            "metrics": metrics,
+            "cvl_m_s": round(cvl_scalar, 4) if np.isfinite(cvl_scalar) else None,
+            "cvt_m_s": round(cvt_scalar, 4) if np.isfinite(cvt_scalar) else None,
+            "anisotropy_ratio": round(aniso_scalar, 3) if np.isfinite(aniso_scalar) else None,
+            "fiber_angle_deg": round(angle_scalar, 1) if np.isfinite(angle_scalar) else None,
+            "fiber_coherence": round(coher_scalar, 4) if np.isfinite(coher_scalar) else None,
+            "n_sources": n_sources_total,
+            "phenotype": phenotype,
+            "primary_method": primary_method,
+            "fallback_used": method_counts.get("structure_tensor", 0) > 0,
+            "beats_method_distribution": method_dist,
+            "avg_valid_fraction": {
+                "gradient_angular": round(avg_grad_frac, 4) if np.isfinite(avg_grad_frac) else None,
+                "structure_tensor": round(avg_st_frac, 4) if np.isfinite(avg_st_frac) else None,
+            },
+            "elapsed_s": elapsed,
         }
         self.save_must(report, "conduction_report.json")
 
-        # DEBUG
-        # Сохраняем per-beat CV stack (может быть большим)
-        valid_beats_cv = []
-        for i, b in enumerate(beat_stats):
-            if not b.get("skipped", False) and i < per_beat_activation.shape[0]:
-                bm = per_beat_activation[i]
-                if np.any(np.isfinite(bm[mask])):
-                    cv_b, _, _ = self._compute_beat_cv(bm, mask, pixel_size_mm)
-                    valid_beats_cv.append(cv_b)
-        if valid_beats_cv:
-            self.save_debug(np.array(valid_beats_cv), "cv_per_beat.npy")
-        self.save_debug(cv_coherence, "cv_coherence.npy")
+        # Save DEBUG — per-beat stacks (already collected in _compute_all_beats)
+        beats_cv = getattr(self, '_beats_cv', [])
+        beats_cvl = getattr(self, '_beats_cvl', [])
+        beats_cvt = getattr(self, '_beats_cvt', [])
+        beats_aniso = getattr(self, '_beats_aniso', [])
+        if beats_cv:
+            self.save_debug(np.array(beats_cv), "cv_per_beat.npy")
+            self.save_debug(np.array(beats_cvl), "cvl_per_beat.npy")
+            self.save_debug(np.array(beats_cvt), "cvt_per_beat.npy")
+            self.save_debug(np.array(beats_aniso), "anisotropy_per_beat.npy")
+        self.save_debug(cv_vs_angle_mean, "cv_vs_angle.npy")
         self.save_debug({
             "beat_stats": beat_stats,
-            "verdict":    verdict,
-            "reason":     reason,
-            "metrics":    metrics,
+            "verdict": verdict,
+            "reason": reason,
+            "metrics": metrics,
+            "phenotype": phenotype,
+            "method_distribution": method_dist,
         }, "conduction_debug.json")
 
         self._log_metrics({**metrics, "verdict": verdict, "elapsed_s": elapsed})
-        self.logger.info(f"ConductionAgent finished in {elapsed}s — {verdict}")
+        self.logger.info(
+            f"ConductionAgent done in {elapsed}s — {verdict}, phenotype={phenotype}, "
+            f"methods={method_dist}"
+        )
 
         return {
-            "status":  "success",
+            "status": "success",
             "verdict": verdict,
             "metrics": metrics,
+            "cvl_m_s": cvl_scalar,
+            "cvt_m_s": cvt_scalar,
+            "anisotropy_ratio": aniso_scalar,
+            "phenotype": phenotype,
+            "primary_method": primary_method,
+            "method_distribution": method_dist,
         }
 
 
@@ -431,7 +507,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ConductionAgent standalone")
     parser.add_argument("sample_id", help="Sample ID (e.g. 005A)")
     parser.add_argument("--results-root", default="results")
-    parser.add_argument("--force", action="store_true", help="Recompute even if cv_mean.npy exists")
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     cfg = PipelineConfig({"results_root": args.results_root})
