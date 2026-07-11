@@ -447,7 +447,8 @@ class APDAgent(BaseAgent):
             })
 
         # Save 4-point traces PNG
-        self._save_4point_png(norm, preproc, points, point_results, mask, fps, n_windows, beat_starts)
+        self._save_4point_png(norm, preproc, points, point_results, mask, fps,
+                              n_windows, beat_starts, peaks)
 
         self.logger.info(f"[MUST] Saved: apd_4points_traces.png")
         return point_results
@@ -455,8 +456,17 @@ class APDAgent(BaseAgent):
     def _save_4point_png(self, norm: np.ndarray, raw: np.ndarray,
                         points: list, point_results: list,
                         mask: np.ndarray, fps: float,
-                        n_windows: int, beat_starts: np.ndarray):
-        """Save 4-panel trace figure + points map + APD bars."""
+                        n_windows: int, beat_starts: np.ndarray,
+                        peaks: np.ndarray):
+        """Save 4 individual trace panels (with peaks marked) + points map + APD bars.
+
+        Layout: 3 rows × 2 cols
+          Row 0: P0 trace | P1 trace
+          Row 1: P2 trace | P3 trace
+          Row 2: Points map | APD bars
+        Each trace panel shows ΔF/F with vertical lines at beat starts (red dashed)
+        and peak markers (green dots with annotations).
+        """
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -467,42 +477,50 @@ class APDAgent(BaseAgent):
             n_pts = len(points)
             colors = plt.cm.Set2(np.linspace(0, 1, max(n_pts, 2)))
 
-            # --- Panel 1: Normalized traces (4 points, overlaid) ---
-            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+            fig, axes = plt.subplots(3, 2, figsize=(16, 15))
 
-            # Traces
-            ax = axes[0, 0]
+            # --- Rows 0-1: 4 individual trace panels ---
             for pi, (r, c) in enumerate(points):
+                row, col = pi // 2, pi % 2
+                ax = axes[row, col]
+
                 trace = norm[:, r, c]
-                ax.plot(t_ms, trace, linewidth=0.6, color=colors[pi],
-                        label=f"P{pi} ({r},{c})")
-                # Mark beat starts
-            for bs in beat_starts:
-                ax.axvline(bs * 1000.0 / fps, color='red', linewidth=0.3,
-                           alpha=0.3, linestyle='--')
-            ax.set_xlabel("Time (ms)")
-            ax.set_ylabel("ΔF/F")
-            ax.set_title("Normalized traces (4 points)")
-            ax.legend(fontsize=8, loc='upper right')
-            ax.grid(True, alpha=0.2)
+                ax.plot(t_ms, trace, linewidth=0.7, color=colors[pi])
 
-            # Raw traces
-            ax = axes[0, 1]
-            for pi, (r, c) in enumerate(points):
-                trace = raw[:, r, c].astype(float)
-                ax.plot(t_ms, trace, linewidth=0.6, color=colors[pi],
-                        label=f"P{pi}")
-            for bs in beat_starts:
-                ax.axvline(bs * 1000.0 / fps, color='red', linewidth=0.3,
-                           alpha=0.3, linestyle='--')
-            ax.set_xlabel("Time (ms)")
-            ax.set_ylabel("Raw signal")
-            ax.set_title("Raw traces (4 points)")
-            ax.legend(fontsize=8, loc='upper right')
-            ax.grid(True, alpha=0.2)
+                # Beat starts: red dashed verticals
+                for bs in beat_starts:
+                    ax.axvline(bs * 1000.0 / fps, color='red', linewidth=0.4,
+                               alpha=0.3, linestyle='--')
 
-            # Points on mean frame
-            ax = axes[1, 0]
+                # Peaks: green dots at peak positions
+                pk_ms = peaks[peaks >= 0] * 1000.0 / fps
+                pk_vals = trace[peaks[peaks >= 0]]
+                ax.plot(pk_ms, pk_vals, 'o', color='lime', markersize=4,
+                        zorder=5, label='peaks' if pi == 0 else '')
+
+                # Peak annotations: small frame numbers above dots
+                for fi, pk in enumerate(peaks[peaks >= 0]):
+                    if fi >= len(pk_ms):
+                        break
+                    ax.annotate(f'#{fi}', (pk_ms[fi], pk_vals[fi]),
+                                textcoords="offset points", xytext=(0, 6),
+                                fontsize=6, color='green', alpha=0.7,
+                                ha='center')
+
+                ax.set_xlabel("Time (ms)")
+                ax.set_ylabel("ΔF/F")
+                median_str = ""
+                med = point_results[pi].get("median", {})
+                apd80 = med.get("APD80")
+                if apd80 is not None:
+                    median_str = f" | APD80={apd80:.0f}ms"
+                ax.set_title(f"P{pi} ({r},{c}){median_str}", fontsize=10)
+                ax.grid(True, alpha=0.2)
+                if pi == 0:
+                    ax.legend(fontsize=7, loc='upper right')
+
+            # --- Row 2, col 0: Points on mean frame ---
+            ax = axes[2, 0]
             mean_frame = raw.mean(axis=0)
             masked_frame = mean_frame.copy().astype(float)
             masked_frame[~mask] = np.nan
@@ -517,8 +535,8 @@ class APDAgent(BaseAgent):
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             ax.grid(True, alpha=0.2)
 
-            # APD bar chart
-            ax = axes[1, 1]
+            # --- Row 2, col 1: APD bar chart ---
+            ax = axes[2, 1]
             labels = [f"P{pi}" for pi in range(n_pts)]
             x = np.arange(n_pts)
             width = 0.2
@@ -527,13 +545,14 @@ class APDAgent(BaseAgent):
                 ax.bar(x + i * width, vals, width, label=f'APD{lv}', alpha=0.85)
             ax.set_xlabel("Point")
             ax.set_ylabel("APD (ms)")
-            ax.set_title("APD at 4 points (median over beats)")
+            ax.set_title(f"APD at 4 points (median over {n_windows} beats)")
             ax.set_xticks(x + width * (len(self.levels) - 1) / 2)
             ax.set_xticklabels(labels)
             ax.legend(fontsize=9)
             ax.grid(True, alpha=0.2, axis='y')
 
-            plt.suptitle(f"APD 4-Point Extraction ({n_windows} beats)", fontsize=13)
+            plt.suptitle(f"APD 4-Point Extraction ({n_windows} beats, peaks marked)",
+                         fontsize=13)
             plt.tight_layout(rect=[0, 0, 1, 0.97])
             path = self.must_dir / "apd_4points_traces.png"
             plt.savefig(path, dpi=150, bbox_inches='tight')
