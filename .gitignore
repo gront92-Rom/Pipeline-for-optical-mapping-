@@ -21,3 +21,8 @@ build/
 *.md
 !tracking/*.md
 !docs/**/*.md
+!INSTALL.md
+!requirements.txt
+!Dockerfile
+!install_optimap_dev.sh
+!run_cardiac.sh

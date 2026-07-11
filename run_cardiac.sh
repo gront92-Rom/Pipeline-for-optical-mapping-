@@ -30,7 +30,8 @@ PIPELINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_ROOT="${PIPELINE_ROOT}/results"
 DATA_ROOT="${PIPELINE_ROOT}/data"
 SRC_PATH="${PIPELINE_ROOT}/src"
-DRIVER_TEMPLATE="/tmp/cardiac_driver_$$.py"
+TMP_ROOT="${PIPELINE_ROOT}/tmp"
+DRIVER_TEMPLATE="${TMP_ROOT}/cardiac_driver_$$.py"
 
 DEBUG_MODE=0
 
@@ -45,10 +46,16 @@ Usage: $(basename "$0") [--debug|-d] <sample_id> [input_file]
   sample_id     Logical sample name (e.g. 000A, 004A)
   input_file    Optional path to .rsh/.gsh file (auto-detected if omitted)
 
+Data layout expected next to this script:
+  data/<sample_id>/*.rsh (or .gsh / .rsd / .gsd) — auto-detected
+  src/                  — Python package (added to PYTHONPATH)
+  results/              — created automatically
+  tmp/                  — temporary driver script (created/removed automatically)
+
 Examples:
   $(basename "$0") 000A
   $(basename "$0") --debug 004A
-  $(basename "$0") 004A /mnt/d/data/004A/recording.rsh
+  $(basename "$0") 004A /full/path/to/recording.rsh
 EOF
 }
 
@@ -134,6 +141,7 @@ fi
 # PREPARE OUTPUT
 # =============================================================================
 mkdir -p "$RESULTS_ROOT/$SAMPLE_ID"
+mkdir -p "$TMP_ROOT"  # local temp dir, avoids /tmp portability issues
 TS=$(date +%Y%m%d_%H%M%S)
 LOG_FILE="$RESULTS_ROOT/$SAMPLE_ID/run_${TS}.log"
 SUMMARY_JSON="$RESULTS_ROOT/$SAMPLE_ID/summary.json"
@@ -367,6 +375,8 @@ PYTHONPATH="$SRC_PATH" python3 "$DRIVER_TEMPLATE" 2>&1 | tee "$LOG_FILE"
 EXIT_CODE=$?
 
 rm -f "$DRIVER_TEMPLATE"
+# Clean empty temp dir if nothing left inside
+rmdir "$TMP_ROOT" 2>/dev/null || true
 
 # =============================================================================
 # FINAL REPORT

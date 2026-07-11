@@ -1,0 +1,27 @@
+# Cardiac Optical Mapping Pipeline — pinned runtime dependencies
+# Generated 2026-07-11 from current working environment on Python 3.12.3
+#
+# Install exact optimap dev build FIRST (see install_optimap_dev.sh), then:
+#   pip install -r requirements.txt
+#
+# NOTE: opencv-python is imported as cv2. The package name on PyPI is
+# opencv-python or opencv-python-headless (headless recommended for servers).
+
+# ---------- imaging / signal ----------
+numpy==2.4.4
+scipy==1.17.1
+scikit-image==0.26.0
+matplotlib==3.10.8
+Pillow==10.4.0
+opencv-python-headless==4.13.0.87
+
+# ---------- config / data ----------
+omegaconf==2.3.1
+PyYAML==6.0.3
+pandas==3.0.2
+tqdm==4.67.3
+
+# ---------- MiCAM optical mapping loader (dev build — pinned commit) ----------
+# DO NOT install from PyPI. The required build is a pre-release snapshot from
+# 2026-05-01 (commit 52c156ebb). Use install_optimap_dev.sh before this file.
+# optimap is intentionally omitted here to avoid accidental PyPI install.
