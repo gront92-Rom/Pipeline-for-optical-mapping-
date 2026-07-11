@@ -265,6 +265,15 @@ class APDAgent(BaseAgent):
         # PNG visualization (must/apd_maps.png)
         self._save_png(apd_maps, mask)
 
+        # === 9. 4-point APD extraction (traces + per-point values) ===
+        point_results = self._extract_4point_apd(
+            preproc_video, mask, peaks, beat_starts, beat_ends,
+            fps, bcl_ms, n_windows,
+        )
+        report["points_4"] = point_results
+        # Re-save report with 4-point data
+        self.save_must(report, "apd_report.json")
+
         self.logger.info(
             f"[APD] Done in {time.time()-t0:.2f}s. "
             f"APD80 median={report.get('apd80_median_ms', 'NA')}ms, "
@@ -280,6 +289,257 @@ class APDAgent(BaseAgent):
                                for lv in self.levels},
             "metrics": report,
         }
+
+    # ------------------------------------------------------------------
+    # 4-point APD extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pick_tissue_points(mean_frame: np.ndarray, mask: np.ndarray,
+                            n_points: int = 4,
+                            edge_distance: int = 10) -> list:
+        """Pick N points ~edge_distance px from the mask boundary.
+
+        Strategy: erode mask by edge_distance → border band = mask AND NOT eroded.
+        Divide border band into a 2×2 spatial grid (quadrants), pick brightest
+        pixel in each quadrant. Falls back to full-mask grid if border band
+        is too small.
+        """
+        from scipy.ndimage import binary_erosion
+        from skimage.morphology import disk
+
+        eroded = binary_erosion(mask, disk(edge_distance))
+        border = mask & ~eroded
+
+        ys, xs = np.where(border)
+        used_border = len(ys) >= n_points * 4
+        if not used_border:
+            # Border band too thin — fall back to full mask
+            ys, xs = np.where(mask)
+
+        if len(ys) == 0:
+            return [(mean_frame.shape[0] // 2, mean_frame.shape[1] // 2)]
+
+        # Use |intensity| for brightness (handles inverted VSD preproc)
+        weights = np.abs(mean_frame[ys, xs]).astype(float)
+
+        # 4 angular sectors from centroid (handles elongated/irregular masks)
+        cy, cx = float(np.mean(ys)), float(np.mean(xs))
+        angles = np.arctan2(ys - cy, xs - cx)  # -π..π
+        # Sector 0: [-π/4, π/4) = right, 1: [π/4, 3π/4) = bottom, etc.
+        sector = ((angles + np.pi / 4) // (np.pi / 2) % 4).astype(int)
+
+        points = []
+        for si in range(4):
+            mask_s = sector == si
+            if not mask_s.any():
+                continue
+            wq = np.where(mask_s, weights, -np.inf)
+            # Score = brightness * min_distance_to_existing_points
+            order = np.argsort(wq)[::-1]
+            best_r, best_c, best_score = None, None, -1
+            for bi in order:
+                if wq[bi] == -np.inf:
+                    break
+                r, c = int(ys[bi]), int(xs[bi])
+                if not points:
+                    score = wq[bi]
+                else:
+                    min_d = min(((r - pr)**2 + (c - pc)**2)**0.5 for pr, pc in points)
+                    score = wq[bi] * min_d
+                if score > best_score:
+                    best_score = score
+                    best_r, best_c = r, c
+                    if points and min(((best_r - pr)**2 + (best_c - pc)**2)**0.5 for pr, pc in points) >= 15:
+                        break
+            if best_r is not None:
+                points.append((best_r, best_c))
+
+        # Fill missing from global brightest
+        w_fill = weights.copy()
+        while len(points) < n_points and w_fill.max() >= 0:
+            brightest = int(np.argmax(w_fill))
+            r, c = int(ys[brightest]), int(xs[brightest])
+            if not any(abs(r - pr) < 10 and abs(c - pc) < 10 for pr, pc in points):
+                points.append((r, c))
+            w_fill[brightest] = -np.inf
+
+        return points[:n_points]
+
+    @staticmethod
+    def _measure_apd_point(trace: np.ndarray, peak_idx: int,
+                           end_idx: int, fps: float,
+                           levels: list) -> dict:
+        """Measure APD at given thresholds for a single beat window.
+        APD = time from peak to X% repolarization crossing."""
+        dt_ms = 1000.0 / fps
+        seg = trace[peak_idx:end_idx]
+        if len(seg) < 3:
+            return {f"APD{lv}": None for lv in levels}
+
+        amp = seg[0] - seg.min()
+        if amp <= 0:
+            return {f"APD{lv}": None for lv in levels}
+
+        results = {}
+        for lv in levels:
+            target = seg[0] - lv / 100.0 * amp
+            for fi in range(1, len(seg)):
+                if seg[fi] <= target and seg[fi - 1] > target:
+                    frac = (seg[fi - 1] - target) / (seg[fi - 1] - seg[fi] + 1e-12)
+                    results[f"APD{lv}"] = round((fi - 1 + frac) * dt_ms, 1)
+                    break
+            else:
+                results[f"APD{lv}"] = None
+        return results
+
+    def _extract_4point_apd(self, preproc: np.ndarray, mask: np.ndarray,
+                            peaks: np.ndarray, beat_starts: np.ndarray,
+                            beat_ends: np.ndarray, fps: float,
+                            bcl_ms: float, n_windows: int) -> list:
+        """Extract APD at 4 tissue points with traces."""
+        # Use preproc_video for point selection (mean frame)
+        mean_frame = preproc.mean(axis=0)
+        points = self._pick_tissue_points(mean_frame, mask, n_points=4)
+        self.logger.info(f"[APD] 4-point: {points}")
+
+        # Normalize traces: ΔF/F per pixel (p10 baseline)
+        f0 = np.percentile(preproc, axis=0, q=10)
+        f0 = np.where(f0 < 1, 1, f0)
+        norm = (preproc.astype(np.float64) - f0) / f0
+
+        point_results = []
+        for pi, (r, c) in enumerate(points):
+            trace_norm = norm[:, r, c]
+            trace_raw = preproc[:, r, c].astype(float)
+
+            # Per-beat APD
+            per_beat_apds = []
+            for bi in range(n_windows):
+                start_f = int(beat_starts[bi])
+                end_f = int(beat_ends[bi])
+                if start_f < 0 or end_f <= start_f:
+                    per_beat_apds.append({f"APD{lv}": None for lv in self.levels})
+                    continue
+                apd = self._measure_apd_point(
+                    trace_norm, start_f, end_f, fps, self.levels)
+                per_beat_apds.append(apd)
+
+            # Median APD across beats
+            median_apd = {}
+            for lv in self.levels:
+                vals = [pb[f"APD{lv}"] for pb in per_beat_apds
+                        if pb[f"APD{lv}"] is not None]
+                if vals:
+                    median_apd[f"APD{lv}"] = round(float(np.median(vals)), 1)
+                    median_apd[f"APD{lv}_std"] = round(float(np.std(vals)), 1)
+                    median_apd[f"APD{lv}_n"] = len(vals)
+                else:
+                    median_apd[f"APD{lv}"] = None
+                    median_apd[f"APD{lv}_std"] = None
+                    median_apd[f"APD{lv}_n"] = 0
+
+            point_results.append({
+                "point": pi,
+                "row": r, "col": c,
+                "per_beat": per_beat_apds,
+                "median": median_apd,
+            })
+
+        # Save 4-point traces PNG
+        self._save_4point_png(norm, preproc, points, point_results, mask, fps, n_windows, beat_starts)
+
+        self.logger.info(f"[MUST] Saved: apd_4points_traces.png")
+        return point_results
+
+    def _save_4point_png(self, norm: np.ndarray, raw: np.ndarray,
+                        points: list, point_results: list,
+                        mask: np.ndarray, fps: float,
+                        n_windows: int, beat_starts: np.ndarray):
+        """Save 4-panel trace figure + points map + APD bars."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            T = norm.shape[0]
+            t_ms = np.arange(T) * 1000.0 / fps
+            n_pts = len(points)
+            colors = plt.cm.Set2(np.linspace(0, 1, max(n_pts, 2)))
+
+            # --- Panel 1: Normalized traces (4 points, overlaid) ---
+            fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+            # Traces
+            ax = axes[0, 0]
+            for pi, (r, c) in enumerate(points):
+                trace = norm[:, r, c]
+                ax.plot(t_ms, trace, linewidth=0.6, color=colors[pi],
+                        label=f"P{pi} ({r},{c})")
+                # Mark beat starts
+            for bs in beat_starts:
+                ax.axvline(bs * 1000.0 / fps, color='red', linewidth=0.3,
+                           alpha=0.3, linestyle='--')
+            ax.set_xlabel("Time (ms)")
+            ax.set_ylabel("ΔF/F")
+            ax.set_title("Normalized traces (4 points)")
+            ax.legend(fontsize=8, loc='upper right')
+            ax.grid(True, alpha=0.2)
+
+            # Raw traces
+            ax = axes[0, 1]
+            for pi, (r, c) in enumerate(points):
+                trace = raw[:, r, c].astype(float)
+                ax.plot(t_ms, trace, linewidth=0.6, color=colors[pi],
+                        label=f"P{pi}")
+            for bs in beat_starts:
+                ax.axvline(bs * 1000.0 / fps, color='red', linewidth=0.3,
+                           alpha=0.3, linestyle='--')
+            ax.set_xlabel("Time (ms)")
+            ax.set_ylabel("Raw signal")
+            ax.set_title("Raw traces (4 points)")
+            ax.legend(fontsize=8, loc='upper right')
+            ax.grid(True, alpha=0.2)
+
+            # Points on mean frame
+            ax = axes[1, 0]
+            mean_frame = raw.mean(axis=0)
+            masked_frame = mean_frame.copy().astype(float)
+            masked_frame[~mask] = np.nan
+            im = ax.imshow(masked_frame, cmap='gray', aspect='auto')
+            for pi, (r, c) in enumerate(points):
+                ax.plot(c, r, 'o', markersize=10, markeredgecolor=colors[pi],
+                        markerfacecolor='none', markeredgewidth=2.5)
+                ax.annotate(f"P{pi}", (c, r), textcoords="offset points",
+                            xytext=(5, 5), color=colors[pi], fontsize=12,
+                            fontweight='bold')
+            ax.set_title("Sampling points on mean frame")
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            ax.grid(True, alpha=0.2)
+
+            # APD bar chart
+            ax = axes[1, 1]
+            labels = [f"P{pi}" for pi in range(n_pts)]
+            x = np.arange(n_pts)
+            width = 0.2
+            for i, lv in enumerate(self.levels):
+                vals = [pr["median"].get(f"APD{lv}", 0) or 0 for pr in point_results]
+                ax.bar(x + i * width, vals, width, label=f'APD{lv}', alpha=0.85)
+            ax.set_xlabel("Point")
+            ax.set_ylabel("APD (ms)")
+            ax.set_title("APD at 4 points (median over beats)")
+            ax.set_xticks(x + width * (len(self.levels) - 1) / 2)
+            ax.set_xticklabels(labels)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.2, axis='y')
+
+            plt.suptitle(f"APD 4-Point Extraction ({n_windows} beats)", fontsize=13)
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            path = self.must_dir / "apd_4points_traces.png"
+            plt.savefig(path, dpi=150, bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            self.logger.warning(f"4-point PNG skipped: {e}")
 
 
     # ------------------------------------------------------------------
