@@ -117,6 +117,11 @@ class APDAgent(BaseAgent):
                 f"Sample {self.sample_id} needs manual review."
             )
 
+        # Determine polarity: VSD (dye A) = inverted, CaT (dye B) = non-inverted
+        dye = str(metadata.get("dye") or metadata.get("recording_mode") or "A").upper().strip()
+        invert = dye not in ("B", "CALCIUM", "CAT", "CA")
+        self.logger.info(f"[APD] dye={dye}, invert={invert} ({'VSD' if invert else 'CaT'} polarity)")
+
         # === 2. Compute beat windows (peak[i], peak[i+1]) ===
         # Last beat: extend by BCL frames (no next peak)
         if n_beats > 1:
@@ -184,6 +189,7 @@ class APDAgent(BaseAgent):
                     preproc_video, int(h), int(w),
                     start_f, end_f, fps,
                     levels=self.levels, min_amp=min_amp,
+                    invert=invert,
                 )
 
                 # Outlier rejection
@@ -618,7 +624,7 @@ if __name__ == "__main__":
         "results_root": args.results_root,
         "apd": {
             "levels": [30, 50, 80],
-            "min_amp_abs": 100.0,
+            "min_amp_abs": 10.0,
             "min_amp_noise_mult": 3.0,
         },
     })
