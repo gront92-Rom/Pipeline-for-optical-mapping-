@@ -62,7 +62,7 @@ class ActivationAgent(BaseAgent):
             )
 
         act_cfg = getattr(self.config, 'activation', {}) or {}
-        self.min_amp = float(act_cfg.get('min_amp', 20.0))
+        self.min_amp = float(act_cfg.get('min_amp', 10.0))
         self.sigma_spatial = float(act_cfg.get('sigma_spatial', 1.0))
         self.falling_edge = bool(act_cfg.get('falling_edge', False))
         self.parabolic_interp = bool(act_cfg.get('parabolic_interp', False))
