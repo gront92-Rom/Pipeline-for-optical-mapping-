@@ -315,10 +315,10 @@ class LoaderAgent(BaseAgent):
         self.save_debug(trace_raw, "sideline_trace_raw.npy")
         self.save_debug(trace, "sideline_trace_inv.npy")
 
-        # 4. ASLS baseline correction (lam=1e7, p=0.01, niter=3)
+        # 4. ASLS baseline correction (lam=1e5, p=0.01, niter=3)
         try:
             from cardiac_pipeline.utils.preprocess import asls_baseline_correct_trace
-            asls_lam = 1e7
+            asls_lam = 1e5
             baseline = asls_baseline_correct_trace(trace, lam=asls_lam, p=0.01, niter=3)
             trace_bc = (trace - baseline).astype(np.float32)
             self.save_debug(baseline.astype(np.float32), "sideline_baseline.npy")
@@ -350,7 +350,7 @@ class LoaderAgent(BaseAgent):
         self.save_debug(trace_filtered, "sideline_trace.npy")
         self.logger.warning(
             f"Sideline-режим: {T} кадров >= порога {self.sideline_threshold}. "
-            f"Pipeline: 3×3 → invert → trim 30ms → ASLS(1e7) → Butterworth 80Hz."
+            f"Pipeline: 3×3 → invert → trim 30ms → ASLS(1e5) → Butterworth 80Hz."
         )
 
         # 6. 4-panel PNG (always generated in sideline mode)
@@ -380,7 +380,7 @@ class LoaderAgent(BaseAgent):
             # Panel 3: after ASLS baseline correction
             axes[2].plot(t_ms, trace_bc, lw=0.5, color="C1")
             axes[2].set_ylabel("BC (ASLS)")
-            axes[2].set_title("3. ASLS baseline-corrected (lam=1e7, p=0.01, niter=3)")
+            axes[2].set_title("3. ASLS baseline-corrected (lam=1e5, p=0.01, niter=3)")
 
             # Panel 4: after Butterworth 80 Hz (final trace for peak detection)
             axes[3].plot(t_ms, trace_filtered, lw=0.5, color="C2")
@@ -404,7 +404,7 @@ class LoaderAgent(BaseAgent):
             "inverted": inverted,
             "lp_cutoff_hz": lp_cutoff_hz,
             "baseline_corrected": True,
-            "asls_lam": 1e7,
+            "asls_lam": 1e5,
             "trim_samples": n_trim,
             "trim_seconds": n_trim / fps if fps else None,
         }
