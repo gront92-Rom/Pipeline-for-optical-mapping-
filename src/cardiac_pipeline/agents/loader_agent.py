@@ -267,54 +267,45 @@ class LoaderAgent(BaseAgent):
         """
         Sideline-режим для длинных записей (>= sideline_threshold кадров).
 
-        Шаги:
-          1. Среднее центрального 3×3 ROI → raw trace.
-          2. Инверсия для VSD (dye=A): trace = -trace — пики AP смотрят ВВЕРХ
-             (та же логика, что и preprocess_video() для VSD).
-             Для CaT (dye=B) — без инверсии.
-          3. Gaussian LPF 100 Hz (sigma_frames = fps / (2π·100)).
-          4. Сохранение:
-             - debug/sideline_trace.npy     — финальный трейс (после инверсии + LPF)
-             - debug/sideline_trace_raw.npy — сырой ROI trace (до обработки, для отладки)
+        Pipeline (5 steps):
+          1. Extract central 3×3 ROI mean → raw trace.
+          2. Invert for VSD (dye=A): trace = -trace (AP peaks point UP).
+             For CaT (dye=B) — no inversion.
+          3. Trim 30 ms from each edge (LP ringing + ASLS boundary drift).
+          4. ASLS baseline correction (lam=1e7, p=0.01, niter=3) → baseline-corrected trace.
+          5. Butterworth LPF 80 Hz (4-pole zero-phase) → final trace for peak detection.
+
+        Saves:
+          debug/sideline_trace_raw.npy   — raw ROI trace (pre-everything)
+          debug/sideline_trace_inv.npy   — after invert + trim
+          debug/sideline_baseline.npy    — ASLS baseline
+          debug/sideline_trace_bc.npy    — after ASLS baseline correction (pre-Butterworth)
+          debug/sideline_trace.npy       — final trace (after Butterworth 80 Hz) — for peak detection
+          must/sideline_4panel.png       — 4-panel diagnostic PNG
         """
         T, H, W = video.shape
         cy, cx = H // 2, W // 2
         y0, y1 = max(0, cy - 1), min(H, cy + 2)
         x0, x1 = max(0, cx - 1), min(W, cx + 2)
+
+        # 1. Extract central 3×3 mean
         trace_raw = np.mean(video[:, y0:y1, x0:x1], axis=(1, 2)).astype(np.float32)
 
-        # 2. Инверсия для VSD (dye A) — как в preprocess_video()
+        # 2. Invert for VSD (dye A) — AP peaks point UP
         dye = metadata.get("dye")
-        if isinstance(dye, str) and dye.strip().upper().startswith("A"):
+        inverted = isinstance(dye, str) and dye.strip().upper().startswith("A")
+        if inverted:
             trace = -trace_raw
             self.logger.info("Sideline: применена инверсия (VSD/dye A)")
         else:
             trace = trace_raw.copy()
             self.logger.info("Sideline: инверсия НЕ применена (CaT/dye B или неизвестно)")
 
-        # 3. Gaussian LPF 100 Hz (только если fps известен)
+        # 3. Trim 30 ms from each edge (BEFORE ASLS — avoids LP ringing + ASLS drift)
         fps = metadata.get("fps")
-        lp_cutoff_hz = 100.0
-        if isinstance(fps, (int, float)) and fps > 0:
-            sigma_frames = float(fps) / (2.0 * np.pi * lp_cutoff_hz)
-            # Симметричный Gaussian FIR (окно ±4σ)
-            radius = max(1, int(np.ceil(4 * sigma_frames)))
-            x = np.arange(-radius, radius + 1, dtype=np.float32)
-            kernel = np.exp(-0.5 * (x / sigma_frames) ** 2).astype(np.float32)
-            kernel /= kernel.sum()
-            # np.convolve с mode='same' — корректный zero-padding
-            trace = np.convolve(trace, kernel, mode="same").astype(np.float32)
-            self.logger.info(
-                f"Sideline: LPF {lp_cutoff_hz} Hz applied (sigma={sigma_frames:.2f} frames @ {fps} Hz)"
-            )
-        else:
-            self.logger.warning(f"Sideline: fps неизвестен ({fps}), LPF пропущен")
-
-        # 4. Сохранение
-        # 5. Trim edge artefacts (LP filter ringing at start/end).
-        # ASLS also drifts at boundaries. Drop ~30ms from each end.
+        lp_cutoff_hz = 80.0
         n_trim = max(int(fps * 0.030), 5)  # ≥5 samples, ~30ms @any fps
-        if len(trace_raw) > 2 * n_trim + 10 and len(trace) > 2 * n_trim + 10:
+        if len(trace_raw) > 2 * n_trim + 10:
             trace_raw = trace_raw[n_trim:-n_trim]
             trace     = trace[n_trim:-n_trim]
             self.logger.info(f"Sideline: trimmed {n_trim} samples ({n_trim/fps*1000:.1f}ms) from each edge")
@@ -322,43 +313,47 @@ class LoaderAgent(BaseAgent):
             self.logger.warning(f"Sideline: trace too short ({len(trace)} samples) to trim, skipped")
 
         self.save_debug(trace_raw, "sideline_trace_raw.npy")
-        self.save_debug(trace, "sideline_trace.npy")
-        self.logger.warning(
-            f"Sideline-режим: {T} кадров >= порога {self.sideline_threshold}. "
-            "Сохранены raw + LP100Hz инвертированный (если dye=A) центральный трейс."
-        )
+        self.save_debug(trace, "sideline_trace_inv.npy")
 
-        # 6. Baseline correction: TWO versions
-        #   trace_bc      — для analysis / activation maps (жёсткая, lam=1e7, baseline только DC)
-        #   trace_bc_lite — для peak detection (реактивная, lam=5e5, оставляет amplitude peaks)
+        # 4. ASLS baseline correction (lam=1e7, p=0.01, niter=3)
         try:
             from cardiac_pipeline.utils.preprocess import asls_baseline_correct_trace
-
-            # 6a. Hard baseline — не хватает пики (подходит для analysis)
-            hard_lam = 1e7
-            hard_bl = asls_baseline_correct_trace(trace, lam=hard_lam, p=0.01, niter=3)
-            trace_bc = (trace - hard_bl).astype(np.float32)
-            self.save_debug(hard_bl.astype(np.float32), "sideline_baseline.npy")
+            asls_lam = 1e7
+            baseline = asls_baseline_correct_trace(trace, lam=asls_lam, p=0.01, niter=3)
+            trace_bc = (trace - baseline).astype(np.float32)
+            self.save_debug(baseline.astype(np.float32), "sideline_baseline.npy")
             self.save_debug(trace_bc, "sideline_trace_bc.npy")
-
-            # 6b. Soft baseline — reactive, оставляет пики целыми (для peak detection)
-            soft_lam = 5e5
-            soft_bl = asls_baseline_correct_trace(trace, lam=soft_lam, p=0.01, niter=3)
-            trace_bc_lite = (trace - soft_bl).astype(np.float32)
-            self.save_debug(soft_bl.astype(np.float32), "sideline_baseline_lite.npy")
-            self.save_debug(trace_bc_lite, "sideline_trace_bc_lite.npy")
-
-            self.logger.info(
-                f"Sideline: ASLS baseline correction applied:\n"
-                f"  hard (analysis):  lam={hard_lam:.0e} → sideline_baseline.npy + sideline_trace_bc.npy\n"
-                f"  soft (peak det):  lam={soft_lam:.0e} → sideline_baseline_lite.npy + sideline_trace_bc_lite.npy"
-            )
+            self.logger.info(f"Sideline: ASLS baseline (lam={asls_lam:.0e}, p=0.01, niter=3) applied")
         except Exception as e:
-            self.logger.warning(f"ASLS baseline correction failed: {e}, using raw LP trace")
+            self.logger.warning(f"ASLS baseline correction failed: {e}, using inverted trace")
             trace_bc = trace
-            trace_bc_lite = trace
+            baseline = np.zeros_like(trace)
 
-        # 7. 4-panel PNG (always generated in sideline mode)
+        # 5. Butterworth LPF 80 Hz (4-pole zero-phase biquad cascade)
+        if isinstance(fps, (int, float)) and fps > 0:
+            try:
+                from scipy.signal import filtfilt, butter
+                wn = lp_cutoff_hz / (fps / 2.0)
+                wn = min(wn, 0.99)  # safety: Nyquist
+                b, a = butter(4, wn, btype='low')
+                trace_filtered = filtfilt(b, a, trace_bc).astype(np.float32)
+                self.logger.info(
+                    f"Sideline: Butterworth LPF {lp_cutoff_hz} Hz (4-pole zero-phase) applied @ {fps} Hz"
+                )
+            except Exception as e:
+                self.logger.warning(f"Butterworth LPF failed: {e}, using BC trace")
+                trace_filtered = trace_bc
+        else:
+            self.logger.warning(f"Sideline: fps неизвестен ({fps}), Butterworth LPF пропущен")
+            trace_filtered = trace_bc
+
+        self.save_debug(trace_filtered, "sideline_trace.npy")
+        self.logger.warning(
+            f"Sideline-режим: {T} кадров >= порога {self.sideline_threshold}. "
+            f"Pipeline: 3×3 → invert → trim 30ms → ASLS(1e7) → Butterworth 80Hz."
+        )
+
+        # 6. 4-panel PNG (always generated in sideline mode)
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -372,26 +367,26 @@ class LoaderAgent(BaseAgent):
                 fontsize=13, fontweight="bold",
             )
 
-            # Panel 1: raw ROI trace (pre-invert, pre-LPF)
+            # Panel 1: raw ROI trace (pre-invert, pre-everything)
             axes[0].plot(t_ms, trace_raw, lw=0.5, color="gray")
             axes[0].set_ylabel("raw ROI")
-            axes[0].set_title("1. Raw central 3×3 mean (pre-invert, pre-LPF)")
+            axes[0].set_title("1. Raw central 3×3 mean (pre-invert, pre-everything)")
 
-            # Panel 2: oriented + LPF 100Hz
+            # Panel 2: after invert + trim
             axes[1].plot(t_ms, trace, lw=0.5, color="C0")
-            axes[1].set_ylabel("LPF 100Hz")
-            axes[1].set_title(f"2. After {'invert + ' if isinstance(dye, str) and dye.strip().upper().startswith('A') else ''}Gaussian LPF 100 Hz")
+            axes[1].set_ylabel("inverted")
+            axes[1].set_title(f"2. After {'invert + ' if inverted else ''}trim {n_trim/fps*1000:.0f}ms")
 
-            # Panel 3: ASLS hard baseline-corrected (analysis)
+            # Panel 3: after ASLS baseline correction
             axes[2].plot(t_ms, trace_bc, lw=0.5, color="C1")
-            axes[2].set_ylabel("BC hard")
-            axes[2].set_title("3. ASLS hard baseline (lam=1e7) — for analysis")
+            axes[2].set_ylabel("BC (ASLS)")
+            axes[2].set_title("3. ASLS baseline-corrected (lam=1e7, p=0.01, niter=3)")
 
-            # Panel 4: ASLS soft baseline-corrected (peak detection)
-            axes[4-1].plot(t_ms, trace_bc_lite, lw=0.5, color="C2")
-            axes[4-1].set_ylabel("BC lite")
-            axes[4-1].set_title("4. ASLS soft baseline (lam=5e5) — for peak detection")
-            axes[4-1].set_xlabel("time [ms]" if fps else "frame")
+            # Panel 4: after Butterworth 80 Hz (final trace for peak detection)
+            axes[3].plot(t_ms, trace_filtered, lw=0.5, color="C2")
+            axes[3].set_ylabel("Butter 80Hz")
+            axes[3].set_title("4. Butterworth LPF 80 Hz (4-pole zero-phase) — for peak detection")
+            axes[3].set_xlabel("time [ms]" if fps else "frame")
 
             fig.tight_layout(rect=[0, 0, 1, 0.95])
             png_path = self.get_path("sideline_4panel.png", kind="must")
@@ -406,11 +401,10 @@ class LoaderAgent(BaseAgent):
             "n_frames": T,
             "shape":    list(video.shape),
             "dye":      dye,
-            "inverted": isinstance(dye, str) and dye.strip().upper().startswith("A"),
+            "inverted": inverted,
             "lp_cutoff_hz": lp_cutoff_hz,
             "baseline_corrected": True,
-            "asls_hard_lam": 1e7,
-            "asls_soft_lam": 5e5,
+            "asls_lam": 1e7,
             "trim_samples": n_trim,
             "trim_seconds": n_trim / fps if fps else None,
         }
