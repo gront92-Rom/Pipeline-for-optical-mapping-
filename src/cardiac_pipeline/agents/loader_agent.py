@@ -281,31 +281,68 @@ class LoaderAgent(BaseAgent):
         fps: float,
         sample_id: str,
         video: np.ndarray = None,
+        dye: str = None,
     ) -> None:
         """
-        Сохраняет PNG стим-трейса (col 2) + флуоресцентного трейса (tissue mean).
+        Сохраняет PNG стим-трейса (col 2) + обработанного флуоресцентного трейса.
 
         Две панели, sharex:
           top:    col 2 mean — стимуляционный канал, с shading onsets/offsets
-          bottom: tissue fluorescence — mean по tissue cols (20..W-8), rows all
+          bottom: 3×3 central ROI → invert (dye A) → trim 30ms → ASLS(1e5) → Butterworth 80Hz
+                  (тот же pipeline что в _handle_sideline, но без peak detection)
         """
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
-            T = len(stim_trace)
-            t_ms = np.arange(T, dtype=np.float64) / fps * 1000.0 if fps else np.arange(T)
+            T_stim = len(stim_trace)
+            t_ms = np.arange(T_stim, dtype=np.float64) / fps * 1000.0 if fps else np.arange(T_stim)
             baseline = np.median(stim_trace)
             threshold = baseline - 500
 
-            # Tissue fluorescence: mean по tissue-области (cols 20..W-8, все rows)
+            # --- Process tissue fluorescence: 3×3 ROI → invert → trim → ASLS → Butterworth ---
             tissue_trace = None
+            t_tissue_ms = None
             if video is not None:
                 T2, H, W = video.shape
-                col_start = min(20, W - 1)
-                col_end = max(col_start + 1, W - 8)
-                tissue_trace = video[:, :, col_start:col_end].mean(axis=(1, 2))
+                cy, cx = H // 2, W // 2
+                y0, y1 = max(0, cy - 1), min(H, cy + 2)
+                x0, x1 = max(0, cx - 1), min(W, cx + 2)
+
+                # 1. Central 3×3 mean
+                trace_raw = np.mean(video[:, y0:y1, x0:x1], axis=(1, 2)).astype(np.float32)
+
+                # 2. Invert for VSD (dye A)
+                inverted = isinstance(dye, str) and dye.strip().upper().startswith("A")
+                trace = -trace_raw if inverted else trace_raw.copy()
+
+                # 3. Trim 30ms from each edge
+                n_trim = max(int(fps * 0.030), 5) if fps else 5
+                if len(trace_raw) > 2 * n_trim + 10:
+                    trace = trace[n_trim:-n_trim]
+                    trace_raw = trace_raw[n_trim:-n_trim]
+
+                # 4. ASLS baseline correction (lam=1e5, p=0.01, niter=3)
+                try:
+                    from cardiac_pipeline.utils.preprocess import asls_baseline_correct_trace
+                    trace_bc = asls_baseline_correct_trace(trace, lam=1e5, p=0.01, niter=3).astype(np.float32)
+                except Exception:
+                    trace_bc = trace
+
+                # 5. Butterworth LPF 80 Hz
+                if fps and fps > 0:
+                    try:
+                        from scipy.signal import filtfilt, butter
+                        wn = min(80.0 / (fps / 2.0), 0.99)
+                        b, a = butter(4, wn, btype='low')
+                        tissue_trace = filtfilt(b, a, trace_bc).astype(np.float32)
+                    except Exception:
+                        tissue_trace = trace_bc
+                else:
+                    tissue_trace = trace_bc
+
+                t_tissue_ms = np.arange(len(tissue_trace), dtype=np.float64) / fps * 1000.0 if fps else np.arange(len(tissue_trace))
 
             n_panels = 2 if tissue_trace is not None else 1
             fig, axes = plt.subplots(
@@ -326,7 +363,8 @@ class LoaderAgent(BaseAgent):
             # Shade stim pulses
             for on, off in zip(pulse_onsets, pulse_offsets):
                 ax.axvspan(
-                    t_ms[on] if on < T else on, t_ms[off] if off < T else off,
+                    t_ms[on] if on < T_stim else on,
+                    t_ms[off] if off < T_stim else off,
                     color="red", alpha=0.2,
                 )
 
@@ -337,21 +375,22 @@ class LoaderAgent(BaseAgent):
             )
             ax.legend(loc="upper right", fontsize=8)
 
-            # --- Bottom: tissue fluorescence ---
+            # --- Bottom: processed tissue fluorescence (3×3 → ASLS → Butterworth) ---
             if tissue_trace is not None:
                 ax2 = axes[1]
-                ax2.plot(t_ms, tissue_trace, lw=0.5, color="royalblue",
-                          label="tissue mean (cols 20..W-8)")
+                ax2.plot(t_tissue_ms, tissue_trace, lw=0.8, color="royalblue",
+                          label="3×3 ROI → ASLS → Butterworth 80Hz")
                 # Shade stim pulses на нижней панели тоже
                 for on, off in zip(pulse_onsets, pulse_offsets):
                     ax2.axvspan(
-                        t_ms[on] if on < T else on,
-                        t_ms[off] if off < T else off,
+                        t_ms[on] if on < T_stim else on,
+                        t_ms[off] if off < T_stim else off,
                         color="red", alpha=0.1,
                     )
                 ax2.set_xlabel("time [ms]" if fps else "frame")
-                ax2.set_ylabel("fluorescence (a.u.)")
-                ax2.set_title("Tissue fluorescence — spatial mean")
+                ax2.set_ylabel("ΔF/F (a.u.)")
+                dye_label = f" | dye={dye}" if dye else ""
+                ax2.set_title(f"Tissue fluorescence — 3×3 central ROI{dye_label}")
                 ax2.legend(loc="upper right", fontsize=8)
 
             fig.tight_layout()
@@ -1140,6 +1179,7 @@ class LoaderAgent(BaseAgent):
                     fps,
                     self.sample_id,
                     video=video,
+                    dye=dye,
                 )
         except Exception as e:
             self.logger.warning(f"StimExtract failed: {e}")
