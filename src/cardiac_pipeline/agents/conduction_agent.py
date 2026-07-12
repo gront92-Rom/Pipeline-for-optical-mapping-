@@ -303,9 +303,29 @@ class ConductionAgent(BaseAgent):
             )
 
             beats_cv.append(primary["cv_map"])
-            beats_cvl.append(primary["cvl_map"])
-            beats_cvt.append(primary["cvt_map"])
-            beats_aniso.append(primary["anisotropy_map"])
+
+            # --- Hybrid consensus (Variant A) ---
+            # Gradient angular не создаёт per-pixel CVL/CVT/anisotropy maps (NaN by design).
+            # Если gradient победил, заимствуем пространственные карты у Structure Tensor,
+            # если его valid_fraction достаточна (>0.4). Это спасает MUST-outputs от NaN.
+            st_res = beat_cv.get("st_res", {})
+            st_vf = beat_cv.get("st_valid_fraction", 0.0)
+            if method == "gradient_angular" and st_vf > 0.4:
+                cvl_map = st_res.get("cvl_map", primary["cvl_map"])
+                cvt_map = st_res.get("cvt_map", primary["cvt_map"])
+                aniso_map = st_res.get("anisotropy_map", primary["anisotropy_map"])
+                self.logger.info(
+                    f"  Hybrid consensus: CV_mean from Gradient, "
+                    f"CVL/CVT/aniso maps borrowed from ST (st_vf={st_vf:.3f})"
+                )
+            else:
+                cvl_map = primary["cvl_map"]
+                cvt_map = primary["cvt_map"]
+                aniso_map = primary["anisotropy_map"]
+
+            beats_cvl.append(cvl_map)
+            beats_cvt.append(cvt_map)
+            beats_aniso.append(aniso_map)
             beats_angle.append(primary["fiber_angle_map"])
             beats_coh.append(primary["coherence_map"])
             beats_vx.append(primary["vx"])
@@ -457,6 +477,48 @@ class ConductionAgent(BaseAgent):
             },
             "elapsed_s": elapsed,
         }
+
+        # --- Central ROI metrics ---
+        # Centroid mask: эрозия маски на ~30% радиуса → центральная зона (~20% площади)
+        try:
+            from scipy.ndimage import binary_erosion, center_of_mass
+            rows, cols = np.where(mask)
+            r_c, c_c = center_of_mass(mask)
+            # Радиус ~ 30% от полу-размера маски
+            r_min, r_max = rows.min(), rows.max()
+            c_min, c_max = cols.min(), cols.max()
+            r_rad = (r_max - r_min) * 0.15
+            c_rad = (c_max - c_min) * 0.15
+            yy, xx = np.indices(mask.shape)
+            central_mask = mask & (
+                (np.abs(yy - r_c) < r_rad) & (np.abs(xx - c_c) < c_rad)
+            )
+            central_n = int(central_mask.sum())
+            if central_n > 10:
+                cvl_central = float(np.nanmedian(cvl_mean[central_mask])) if np.isfinite(cvl_mean[central_mask]).any() else None
+                cvt_central = float(np.nanmedian(cvt_mean[central_mask])) if np.isfinite(cvt_mean[central_mask]).any() else None
+                aniso_central = float(np.nanmedian(aniso_mean[central_mask])) if np.isfinite(aniso_mean[central_mask]).any() else None
+                cv_central = float(np.nanmedian(cv_mean[central_mask])) if np.isfinite(cv_mean[central_mask]).any() else None
+                report["central_roi"] = {
+                    "n_pixels": central_n,
+                    "cv_median_m_per_s": round(cv_central, 4) if cv_central is not None else None,
+                    "cvl_m_s": round(cvl_central, 4) if cvl_central is not None else None,
+                    "cvt_m_s": round(cvt_central, 4) if cvt_central is not None else None,
+                    "anisotropy_ratio": round(aniso_central, 3) if aniso_central is not None else None,
+                }
+                self.logger.info(
+                    f"Central ROI: n={central_n}, "
+                    f"CV={cv_central:.3f}, CVL={cvl_central:.3f}, CVT={cvt_central:.3f}, "
+                    f"aniso={aniso_central:.2f}" if all(v is not None for v in [cv_central, cvl_central, cvt_central, aniso_central])
+                    else f"Central ROI: n={central_n}, some metrics NaN"
+                )
+            else:
+                report["central_roi"] = None
+                self.logger.info(f"Central ROI: too small (n={central_n})")
+        except Exception as e:
+            report["central_roi"] = None
+            self.logger.warning(f"Central ROI failed: {e}")
+
         self.save_must(report, "conduction_report.json")
 
         # Save DEBUG — per-beat stacks (already collected in _compute_all_beats)

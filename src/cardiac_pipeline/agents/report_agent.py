@@ -82,6 +82,10 @@ COLUMNS: List[str] = [
     "cvt_m_s",
     "anisotropy_ratio",
     "fiber_angle_deg",
+    "central_cvl_m_s",
+    "central_cvt_m_s",
+    "central_anisotropy_ratio",
+    "central_cv_m_s",
     # --- alternans ---
     "alternans_phenotype",
     "AC_95th_ms",
@@ -247,6 +251,19 @@ class ReportAgent(BaseAgent):
         row["anisotropy_ratio"] = _g(cond, "anisotropy_ratio")
         row["fiber_angle_deg"] = _g(cond, "fiber_angle_deg")
 
+        # --- conduction: central ROI ---
+        central = _g(cond, "central_roi", default={}) or {}
+        if isinstance(central, dict):
+            row["central_cvl_m_s"] = central.get("cvl_m_s")
+            row["central_cvt_m_s"] = central.get("cvt_m_s")
+            row["central_anisotropy_ratio"] = central.get("anisotropy_ratio")
+            row["central_cv_m_s"] = central.get("cv_median_m_per_s")
+        else:
+            row["central_cvl_m_s"] = None
+            row["central_cvt_m_s"] = None
+            row["central_anisotropy_ratio"] = None
+            row["central_cv_m_s"] = None
+
         # --- alternans ---
         # alternans_phenotype: в alternans_report.json ключ "phenotype",
         # в metrics.json — "alternans_phenotype".
@@ -339,6 +356,7 @@ class ReportAgent(BaseAgent):
             f"n_peaks={row.get('n_peaks')} n_beats={row.get('n_beats')} | "
             f"APD80={row.get('apd80_median_ms')}ms | "
             f"CVl={row.get('cvl_m_s')} CVt={row.get('cvt_m_s')} | "
+            f"central CVl={row.get('central_cvl_m_s')} CVt={row.get('central_cvt_m_s')} aniso={row.get('central_anisotropy_ratio')} | "
             f"phenotype={row.get('alternans_phenotype')}"
         )
 

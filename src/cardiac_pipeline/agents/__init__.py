@@ -28,6 +28,7 @@ SidelineAgent contract:
     and abort the main pipeline stages when status == "sideline_isolated".
 """
 
-from cardiac_pipeline.agents.sideline_agent import SidelineAgent
+# SidelineAgent v2 — functional module (no class export)
+# from cardiac_pipeline.agents.sideline_agent import SidelineAgent  # v1, removed
 
-__all__ = ["SidelineAgent"]
+__all__ = []
