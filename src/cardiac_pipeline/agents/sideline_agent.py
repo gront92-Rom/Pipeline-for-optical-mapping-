@@ -136,14 +136,15 @@ class SidelineAgent(BaseAgent):
         return baseline
 
     def _detect_peaks(self, trace: np.ndarray, fps: float, stim_hz: Optional[float] = None) -> np.ndarray:
-        """Simple adaptive peak detector on sideline trace."""
+        """Simple adaptive peak detector on sideline trace.
+
+        Uses stim_hz from metadata if available; otherwise assumes 16 Hz
+        (midpoint of typical 10-20 Hz pacing range for long recordings).
+        """
         from scipy.signal import find_peaks
-        # Distance: at least 0.6 of expected beat interval (frames)
-        if stim_hz and stim_hz > 0:
-            min_dist = int(0.6 * fps / stim_hz)
-        else:
-            # Fallback: use FFT dominant frequency
-            min_dist = max(5, int(fps * 0.2))
+        # Effective pacing frequency: metadata, else 16 Hz default
+        eff_hz = stim_hz if (stim_hz and stim_hz > 0) else 16.0
+        min_dist = int(0.6 * fps / eff_hz)
         # Prominence: robust estimate based on trace IQR
         q25, q75 = np.percentile(trace, [25, 75])
         iqr = q75 - q25
