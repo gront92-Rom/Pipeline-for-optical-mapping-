@@ -272,9 +272,9 @@ def main() -> int:
         ("10/10 Report",       ReportAgent,        {"force": True}),
     ]
 
-    # --- RHYTHM GATE: after Loader, compare stim_hz vs stim_hz_effective ---
-    # If they match (within 15%), tissue is captured 1:1 → skip Sideline.
-    # If not (2:1 capture, escape, or spontaneous) → run Sideline.
+    # --- RHYTHM GATE: after Loader, decide whether to run Sideline ---
+    # Run Sideline if: Δ(stim_hz, fluor_hz) > 2 Hz OR stim_coverage < 0.9
+    # Skip Sideline if: stim ≈ fluor (1:1 capture) AND stimulation covers full recording
     skip_sideline = False
     try:
         meta_path = Path(RESULTS_ROOT) / SAMPLE_ID / "must" / "metadata.json"
@@ -283,14 +283,22 @@ def main() -> int:
             stim_hz = meta.get("stim_hz")
             fluor_hz = meta.get("stim_hz_effective")
             stim_is_paced = meta.get("stim_is_paced", False)
+            stim_coverage = meta.get("stim_coverage", 0.0)
 
             if stim_hz and fluor_hz and stim_is_paced:
                 abs_diff = abs(stim_hz - fluor_hz)
-                if abs_diff < 1.5:
+                freq_match = abs_diff < 2.0
+                coverage_ok = stim_coverage >= 0.9
+                if freq_match and coverage_ok:
                     skip_sideline = True
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz → match → skip Sideline", flush=True)
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz, coverage={stim_coverage:.1%} → match → skip Sideline", flush=True)
                 else:
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz → MISMATCH → run Sideline", flush=True)
+                    reasons = []
+                    if not freq_match:
+                        reasons.append(f"Δ={abs_diff:.2f} Hz > 2 Hz")
+                    if not coverage_ok:
+                        reasons.append(f"coverage={stim_coverage:.1%} < 90%")
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → {' + '.join(reasons)} → run Sideline", flush=True)
             elif not stim_is_paced:
                 # No stim channel — can't compare, run Sideline for safety
                 print(f"\n[RHYTHM GATE] no stim channel detected → run Sideline", flush=True)

@@ -252,6 +252,19 @@ class LoaderAgent(BaseAgent):
 
         method = "col2_drop" if is_paced else "none"
 
+        # Stim coverage: какую долю записи занимает стимуляция
+        # (от первого до последнего пульса + пол-BCL после последнего)
+        stim_coverage = 0.0
+        if n_pulses >= 2:
+            last_pulse_end = offsets[-1] if len(offsets) > 0 else onsets[-1]
+            # Добавляем пол-BCL после последнего пульса (как если бы стим продолжался)
+            if bcl_ms is not None:
+                half_bcl_frames = int(0.5 * bcl_ms * fps / 1000.0)
+                last_pulse_end = min(T - 1, last_pulse_end + half_bcl_frames)
+            stim_coverage = float(last_pulse_end - onsets[0]) / T
+        elif n_pulses == 1:
+            stim_coverage = float(offsets[0] - onsets[0]) / T
+
         self.logger.info(
             f"StimExtract: {n_pulses} pulses, is_paced={is_paced}, "
             f"stim_hz={stim_hz}, bcl_ms={bcl_ms}, "
@@ -271,6 +284,7 @@ class LoaderAgent(BaseAgent):
             "method": method,
             "fps": fps,
             "n_frames": T,
+            "stim_coverage": round(stim_coverage, 3),
         }
 
     def _save_stim_trace_png(
@@ -1171,6 +1185,7 @@ class LoaderAgent(BaseAgent):
                 metadata["stim_is_paced"] = stim_result["is_paced"]
                 metadata["stim_pulse_width_ms"] = stim_result["pulse_width_ms"]
                 metadata["stim_method"] = stim_result["method"]
+                metadata["stim_coverage"] = stim_result.get("stim_coverage", 0.0)
                 # PNG
                 self._save_stim_trace_png(
                     stim_result["stim_trace"],
@@ -1211,13 +1226,10 @@ class LoaderAgent(BaseAgent):
         # Сохраняем обновлённые метаданные
         self.save_must(metadata, "metadata.json")
 
-        # --- 5. Sideline-гейт: длинные записи (T >= sideline_threshold) ---
-        # Спецификация: НЕ сохраняем raw_video.npy, НЕ вызываем preprocess_video().
-        # Только усреднённый трейс центрального ROI + объяснение в debug/sideline_guide.txt.
-        # Cache-скип ниже гарантированно не блокирует sideline (для sideline preproc_video.npy
-        # никогда не создаётся), поэтому force=False достаточно для перезапуска.
-        if T >= self.sideline_threshold:
-            return self._sideline_branch(video, metadata, fps, T, H, W, t0)
+        # --- 5. Sideline-гейт ПО ДЛИНЕ УБРАН ---
+        # Раньше: T >= sideline_threshold → sideline-ветка.
+        # Теперь: всегда full pipeline. Sideline вызывается из run_cardiac.sh
+        # по rhythm gate (Δstim-fluor > 2 Hz ИЛИ stim_coverage < 0.9).
 
         # --- 5b. Загрузка .rsm (background frame) для MaskAgent PRIMARY ---
         rsm_path = input_path.with_suffix(".rsm")
