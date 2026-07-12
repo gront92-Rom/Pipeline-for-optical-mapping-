@@ -272,6 +272,33 @@ def main() -> int:
         ("10/10 Report",       ReportAgent,        {"force": True}),
     ]
 
+    # --- RHYTHM GATE: after Loader, compare stim_hz vs stim_hz_effective ---
+    # If they match (within 15%), tissue is captured 1:1 → skip Sideline.
+    # If not (2:1 capture, escape, or spontaneous) → run Sideline.
+    skip_sideline = False
+    try:
+        meta_path = Path(RESULTS_ROOT) / SAMPLE_ID / "must" / "metadata.json"
+        if meta_path.exists():
+            meta = json.load(open(meta_path))
+            stim_hz = meta.get("stim_hz")
+            fluor_hz = meta.get("stim_hz_effective")
+            stim_is_paced = meta.get("stim_is_paced", False)
+
+            if stim_hz and fluor_hz and stim_is_paced:
+                rel_diff = abs(stim_hz - fluor_hz) / stim_hz
+                if rel_diff < 0.15:
+                    skip_sideline = True
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → match (Δ={rel_diff*100:.1f}%) → skip Sideline", flush=True)
+                else:
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → MISMATCH (Δ={rel_diff*100:.1f}%) → run Sideline", flush=True)
+            elif not stim_is_paced:
+                # No stim channel — can't compare, run Sideline for safety
+                print(f"\n[RHYTHM GATE] no stim channel detected → run Sideline", flush=True)
+            else:
+                print(f"\n[RHYTHM GATE] missing stim_hz or fluor_hz → run Sideline", flush=True)
+    except Exception as e:
+        print(f"\n[RHYTHM GATE] error: {e} → run Sideline (safe default)", flush=True)
+
     results = {
         "sample_id": SAMPLE_ID,
         "input_file": INPUT_FILE,
@@ -289,6 +316,16 @@ def main() -> int:
     last_elapsed = 0.0
 
     for stage_name, AgentClass, kwargs in stages:
+        # Skip Sideline if rhythm gate passed
+        if AgentClass is SidelineAgent and skip_sideline:
+            results["stages"][stage_name] = {
+                "ok": True,
+                "elapsed_s": 0.0,
+                "skipped": "rhythm_gate_match",
+            }
+            print(f"\n=== {stage_name} ===\n  ⊘ SKIPPED (rhythm gate: stim ≈ fluor)", flush=True)
+            continue
+
         t0 = time.time()
         print(f"\n=== {stage_name} ===", flush=True)
 
