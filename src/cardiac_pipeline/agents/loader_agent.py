@@ -278,7 +278,6 @@ class LoaderAgent(BaseAgent):
         Saves:
           debug/sideline_trace_raw.npy   — raw ROI trace (pre-everything)
           debug/sideline_trace_inv.npy   — after invert + trim
-          debug/sideline_baseline.npy    — ASLS baseline
           debug/sideline_trace_bc.npy    — after ASLS baseline correction (pre-Butterworth)
           debug/sideline_trace.npy       — final trace (after Butterworth 80 Hz) — for peak detection
           must/sideline_4panel.png       — 4-panel diagnostic PNG
@@ -316,18 +315,17 @@ class LoaderAgent(BaseAgent):
         self.save_debug(trace, "sideline_trace_inv.npy")
 
         # 4. ASLS baseline correction (lam=1e5, p=0.01, niter=3)
+        # asls_baseline_correct_trace() returns corrected trace (y - baseline),
+        # NOT the baseline itself. No further subtraction needed.
         try:
             from cardiac_pipeline.utils.preprocess import asls_baseline_correct_trace
             asls_lam = 1e5
-            baseline = asls_baseline_correct_trace(trace, lam=asls_lam, p=0.01, niter=3)
-            trace_bc = (trace - baseline).astype(np.float32)
-            self.save_debug(baseline.astype(np.float32), "sideline_baseline.npy")
+            trace_bc = asls_baseline_correct_trace(trace, lam=asls_lam, p=0.01, niter=3).astype(np.float32)
             self.save_debug(trace_bc, "sideline_trace_bc.npy")
-            self.logger.info(f"Sideline: ASLS baseline (lam={asls_lam:.0e}, p=0.01, niter=3) applied")
+            self.logger.info(f"Sideline: ASLS baseline-corrected (lam={asls_lam:.0e}, p=0.01, niter=3) — already corrected (y-baseline)")
         except Exception as e:
             self.logger.warning(f"ASLS baseline correction failed: {e}, using inverted trace")
             trace_bc = trace
-            baseline = np.zeros_like(trace)
 
         # 5. Butterworth LPF 80 Hz (4-pole zero-phase biquad cascade)
         if isinstance(fps, (int, float)) and fps > 0:
