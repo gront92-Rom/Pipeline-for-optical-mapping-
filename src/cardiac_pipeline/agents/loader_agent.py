@@ -267,13 +267,21 @@ class LoaderAgent(BaseAgent):
         """
         Sideline-режим для длинных записей (>= sideline_threshold кадров).
 
-        Pipeline (5 steps):
+        Pipeline (12 steps):
           1. Extract central 3×3 ROI mean → raw trace.
           2. Invert for VSD (dye=A): trace = -trace (AP peaks point UP).
              For CaT (dye=B) — no inversion.
           3. Trim 30 ms from each edge (LP ringing + ASLS boundary drift).
-          4. ASLS baseline correction (lam=1e7, p=0.01, niter=3) → baseline-corrected trace.
+          4. ASLS baseline correction (lam=1e5, p=0.01, niter=3) → baseline-corrected trace.
           5. Butterworth LPF 80 Hz (4-pole zero-phase) → final trace for peak detection.
+          6. 4-panel diagnostic PNG → must/sideline_4panel.png.
+          6b. Peak detection: distance=0.6*fps/stim_hz, prominence=max(IQR*0.5, std*0.3).
+          7. RR statistics — mean, std, CV, regularity (±15% of median), is_regular.
+          8. FFT — dominant frequency 0.5–30 Hz.
+          9. Segmentation — beat-to-beat intervals, each regular/irregular.
+          10. Save: sideline_trace.npz, sideline_trace.png, sideline_metrics.json, sideline_segments.json.
+          11. Human-in-the-loop — sideline_decision_request.json (4 options).
+          12. Returns {"status": "sideline"} → run_cardiac.sh stops pipeline.
 
         Saves:
           debug/sideline_trace_raw.npy   — raw ROI trace (pre-everything)
@@ -281,6 +289,11 @@ class LoaderAgent(BaseAgent):
           debug/sideline_trace_bc.npy    — after ASLS baseline correction (pre-Butterworth)
           debug/sideline_trace.npy       — final trace (after Butterworth 80 Hz) — for peak detection
           must/sideline_4panel.png       — 4-panel diagnostic PNG
+          must/sideline_trace.npz        — raw, oriented, bc, filtered, peaks (compressed)
+          must/sideline_trace.png        — trace + peaks + regularity
+          must/sideline_metrics.json     — all metrics + asls_wander
+          must/sideline_segments.json    — beat-to-beat segments
+          must/sideline_decision_request.json — human-in-the-loop decision
         """
         T, H, W = video.shape
         cy, cx = H // 2, W // 2
@@ -394,6 +407,182 @@ class LoaderAgent(BaseAgent):
         except Exception as e_png:
             self.logger.warning(f"Sideline 4-panel PNG failed: {e_png}")
 
+        # 6b. Peak detection on trace_filtered
+        # distance = 0.6 * fps / stim_hz (minimum beat-to-beat distance)
+        # prominence = max(IQR * 0.5, std * 0.3)
+        from scipy.signal import find_peaks as _find_peaks
+
+        stim_hz = metadata.get("stim_hz_effective") or metadata.get("stim_hz")
+        if not stim_hz or not isinstance(stim_hz, (int, float)) or stim_hz <= 0:
+            stim_hz = 16.0  # fallback (commit d9d8bc3)
+            self.logger.warning(f"Sideline: stim_hz unknown, fallback to {stim_hz} Hz")
+
+        trace_arr = np.asarray(trace_filtered, dtype=np.float64)
+        trace_iqr = np.percentile(trace_arr, 75) - np.percentile(trace_arr, 25)
+        trace_std = np.std(trace_arr)
+        min_dist = max(int(0.6 * fps / stim_hz), 1)
+        min_prom = max(trace_iqr * 0.5, trace_std * 0.3)
+
+        peaks, peak_props = _find_peaks(trace_arr, distance=min_dist, prominence=min_prom)
+        self.logger.info(
+            f"Sideline: peak detection — {len(peaks)} peaks, "
+            f"min_dist={min_dist} frames ({min_dist/fps*1000:.1f}ms), "
+            f"prominence={min_prom:.2f} (IQR={trace_iqr:.2f}, std={trace_std:.2f})"
+        )
+
+        # 7. RR statistics — mean, std, CV, regularity score (±15% of median)
+        if len(peaks) >= 2:
+            rr_intervals_ms = np.diff(peaks) / fps * 1000.0  # ms
+            rr_mean = float(np.mean(rr_intervals_ms))
+            rr_std = float(np.std(rr_intervals_ms))
+            rr_cv = float(rr_std / rr_mean) if rr_mean > 0 else float('nan')
+            rr_median = float(np.median(rr_intervals_ms))
+            # regularity = fraction of RR intervals within ±15% of median
+            regular_mask = np.abs(rr_intervals_ms - rr_median) <= 0.15 * rr_median
+            regularity_score = float(np.mean(regular_mask))
+            is_regular = regularity_score >= 0.8 and rr_cv < 0.2
+            self.logger.info(
+                f"Sideline: RR stats — mean={rr_mean:.2f}ms, std={rr_std:.2f}ms, "
+                f"CV={rr_cv:.4f}, regularity={regularity_score:.3f}, "
+                f"is_regular={is_regular} (median={rr_median:.2f}ms, N={len(rr_intervals_ms)})"
+            )
+        else:
+            rr_intervals_ms = np.array([])
+            rr_mean = rr_std = rr_cv = rr_median = float('nan')
+            regularity_score = 0.0
+            is_regular = False
+            self.logger.warning(f"Sideline: <2 peaks ({len(peaks)}), RR stats unavailable")
+
+        # 8. FFT — dominant frequency in 0.5–30 Hz band
+        dominant_freq = None
+        fft_power = None
+        if len(trace_arr) > 10 and fps and fps > 0:
+            try:
+                from scipy.signal import welch
+                freqs, psd = welch(trace_arr - trace_arr.mean(), fs=fps, nperseg=min(len(trace_arr), 8192))
+                band_mask = (freqs >= 0.5) & (freqs <= 30.0)
+                if np.any(band_mask) and np.any(psd[band_mask] > 0):
+                    band_freqs = freqs[band_mask]
+                    band_psd = psd[band_mask]
+                    idx = int(np.argmax(band_psd))
+                    dominant_freq = float(band_freqs[idx])
+                    fft_power = float(band_psd[idx])
+                self.logger.info(
+                    f"Sideline: FFT — dominant_freq={dominant_freq:.3f} Hz "
+                    f"(power={fft_power:.4f})" if dominant_freq else "Sideline: FFT — no peak in 0.5–30 Hz"
+                )
+            except Exception as e_fft:
+                self.logger.warning(f"Sideline: FFT failed: {e_fft}")
+
+        # 9. Segmentation — beat-to-beat intervals, each regular/irregular
+        segments = []
+        if len(peaks) >= 2:
+            for i in range(len(rr_intervals_ms)):
+                segments.append({
+                    "beat_idx": i,
+                    "peak_idx": int(peaks[i]),
+                    "next_peak_idx": int(peaks[i + 1]),
+                    "rr_ms": float(rr_intervals_ms[i]),
+                    "regular": bool(regular_mask[i]),
+                    "deviation_pct": float(abs(rr_intervals_ms[i] - rr_median) / rr_median * 100) if rr_median > 0 else None,
+                })
+
+        # 10. Save outputs
+        # 10a. sideline_trace.npz — raw, oriented, asls_baseline, bc_trace, filtered, peaks
+        try:
+            npz_path = self.get_path("sideline_trace.npz", kind="must")
+            np.savez_compressed(
+                npz_path,
+                raw=trace_raw,
+                oriented=trace,
+                filtered=trace_filtered,
+                bc=trace_bc,
+                peaks=peaks,
+                fps=fps,
+            )
+            self.logger.info(f"[MUST] Saved: {npz_path.name}")
+        except Exception as e_npz:
+            self.logger.warning(f"Sideline: npz save failed: {e_npz}")
+
+        # 10b. sideline_metrics.json — all numbers + asls_wander
+        try:
+            asls_wander = float(np.std(trace_bc[:int(fps)])) if len(trace_bc) > int(fps) and fps else float(np.std(trace_bc[:100]) if len(trace_bc) > 100 else 0.0)
+        except Exception:
+            asls_wander = None
+
+        metrics_dict = {
+            "n_peaks": int(len(peaks)),
+            "rr_mean_ms": rr_mean if not np.isnan(rr_mean) else None,
+            "rr_std_ms": rr_std if not np.isnan(rr_std) else None,
+            "rr_cv": rr_cv if not np.isnan(rr_cv) else None,
+            "rr_median_ms": rr_median if not np.isnan(rr_median) else None,
+            "regularity_score": regularity_score,
+            "is_regular": bool(is_regular),
+            "dominant_freq_hz": dominant_freq,
+            "fft_power": fft_power,
+            "asls_wander": asls_wander,
+            "asls_lam": 1e5,
+            "stim_hz_used": float(stim_hz),
+            "min_dist_frames": int(min_dist),
+            "min_prominence": float(min_prom),
+            "trim_samples": int(n_trim),
+        }
+        self.save_must(metrics_dict, "sideline_metrics.json")
+
+        # 10c. sideline_segments.json
+        self.save_must(segments, "sideline_segments.json")
+
+        # 10d. sideline_trace.png — trace + peaks + regularity
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig2, ax2 = plt.subplots(figsize=(20, 6))
+            t_ms_full = np.arange(len(trace_filtered), dtype=np.float64) / fps * 1000.0 if fps else np.arange(len(trace_filtered))
+            ax2.plot(t_ms_full, trace_filtered, lw=0.5, color="C2", label="filtered trace")
+            if len(peaks) > 0:
+                ax2.scatter(t_ms_full[peaks], trace_filtered[peaks], c="red", s=20, zorder=5, label=f"peaks (N={len(peaks)})")
+            ax2.set_xlabel("time [ms]" if fps else "frame")
+            ax2.set_ylabel("amplitude")
+            reg_str = "REGULAR" if is_regular else "IRREGULAR"
+            ax2.set_title(
+                f"Sideline trace — {self.sample_id} | "
+                f"RR={rr_mean:.1f}±{rr_std:.1f}ms | CV={rr_cv:.4f} | "
+                f"regularity={regularity_score:.3f} | {reg_str} | "
+                f"dom_freq={dominant_freq:.2f}Hz" if dominant_freq else f"Sideline trace — {self.sample_id} | {reg_str}"
+            )
+            ax2.legend(loc="upper right")
+            fig2.tight_layout()
+            png2_path = self.get_path("sideline_trace.png", kind="must")
+            fig2.savefig(png2_path, dpi=150)
+            plt.close(fig2)
+            self.logger.info(f"[MUST] Saved: {png2_path.name}")
+        except Exception as e_png2:
+            self.logger.warning(f"Sideline trace PNG failed: {e_png2}")
+
+        # 11. Human-in-the-loop — sideline_decision_request.json with 4 options
+        decision_request = {
+            "sample_id": self.sample_id,
+            "mode": "sideline",
+            "n_peaks": int(len(peaks)),
+            "rr_mean_ms": rr_mean if not np.isnan(rr_mean) else None,
+            "rr_cv": rr_cv if not np.isnan(rr_cv) else None,
+            "regularity_score": regularity_score,
+            "is_regular": bool(is_regular),
+            "dominant_freq_hz": dominant_freq,
+            "stim_hz_used": float(stim_hz),
+            "decision_options": {
+                "auto_regular": "Accept regular beats only (filter irregular segments)",
+                "all_regular": "Treat all beats as regular (force regularity)",
+                "custom": "Operator specifies custom beat selection",
+                "skip": "Skip sideline analysis, return to main pipeline",
+            },
+            "recommended": "auto_regular" if is_regular else "custom",
+        }
+        self.save_must(decision_request, "sideline_decision_request.json")
+        self.logger.info("[MUST] Saved: sideline_decision_request.json (human-in-the-loop)")
+
         return {
             "status":   "sideline",
             "n_frames": T,
@@ -405,6 +594,13 @@ class LoaderAgent(BaseAgent):
             "asls_lam": 1e5,
             "trim_samples": n_trim,
             "trim_seconds": n_trim / fps if fps else None,
+            "n_peaks": int(len(peaks)),
+            "rr_mean_ms": rr_mean if not np.isnan(rr_mean) else None,
+            "rr_cv": rr_cv if not np.isnan(rr_cv) else None,
+            "regularity_score": regularity_score,
+            "is_regular": bool(is_regular),
+            "dominant_freq_hz": dominant_freq,
+            "stim_hz_used": float(stim_hz),
         }
 
     def _sideline_branch(
