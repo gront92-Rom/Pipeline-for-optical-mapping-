@@ -130,11 +130,23 @@ class LoaderAgent(BaseAgent):
                 return data[key].astype(np.float32)
             return data.astype(np.float32)
 
+        # Fallback: .gsd/.gsh → .rsh (optimap не умеет .gsd/.gsh напрямую)
+        load_path = input_path
+        if ext in ('.gsd', '.gsh'):
+            rsh_path = input_path.with_suffix('.rsh')
+            if rsh_path.exists():
+                self.logger.info(f"Резолв .{ext} → .rsh: {rsh_path.name}")
+                load_path = rsh_path
+            else:
+                raise RuntimeError(
+                    f"optimap не поддерживает {ext} напрямую, а .rsh не найден: {rsh_path}"
+                )
+
         # Попытка загрузить через optimap
         try:
             import optimap as om
-            self.logger.info(f"Загружаю через optimap: {input_path.name}")
-            return om.load_video(str(input_path)).astype(np.float32)
+            self.logger.info(f"Загружаю через optimap: {load_path.name}")
+            return om.load_video(str(load_path)).astype(np.float32)
         except ImportError:
             raise ImportError(
                 "optimap не установлен. Для загрузки .bvx/.rsh/.gsh файлов "
@@ -142,6 +154,214 @@ class LoaderAgent(BaseAgent):
             )
         except Exception as e:
             raise RuntimeError(f"Ошибка загрузки {input_path}: {e}") from e
+
+    def _extract_stim_from_video(
+        self,
+        video: np.ndarray,
+        fps: float,
+    ) -> dict:
+        """
+        Извлекает стимуляционный канал из col 2 ДО кропа.
+
+        Вызывать ДО _crop_video() — col 2 (индекс 2) попадает в crop_left=20
+        и теряется после кропа.
+
+        Логика та же что в stim_extract_agent.py:
+          - col 2 mean across rows → 1D trace
+          - baseline = median(trace), threshold = baseline - 500
+          - contiguous below-threshold segments = pulses
+          - width >= 3 frames (отсекает 1-frame артефакты)
+          - stim_hz = fps / median(inter-pulse intervals)
+
+        Args:
+            video: (T, H, W) raw video, float32. W должен быть >= 3 (col 2).
+            fps: sampling rate (Hz).
+
+        Returns:
+            dict: {stim_trace, pulse_onsets, pulse_offsets, stim_hz, bcl_ms,
+                  pulse_width_ms, n_pulses, is_paced, method}
+            или None если col 2 недоступна (W < 3).
+        """
+        T, H, W = video.shape
+
+        if W < 3:
+            self.logger.warning(
+                f"StimExtract: W={W} < 3, col 2 недоступна — стим не извлечён"
+            )
+            return None
+
+        # Col 2 mean across rows → 1D trace
+        col2_trace = video[:, :, 2].mean(axis=1).astype(np.float64)
+
+        baseline = np.median(col2_trace)
+
+        # Sanity: baseline must be in expected range (MiCAM stim channel ~6516)
+        if baseline < 6000:
+            self.logger.info(
+                f"StimExtract: baseline={baseline:.0f} < 6000 — стимуляции нет "
+                f"(col 2 не активен)"
+            )
+            return {
+                "stim_trace": col2_trace,
+                "pulse_onsets": np.array([], dtype=int),
+                "pulse_offsets": np.array([], dtype=int),
+                "stim_hz": None,
+                "bcl_ms": None,
+                "pulse_width_ms": None,
+                "n_pulses": 0,
+                "is_paced": False,
+                "method": "none",
+                "fps": fps,
+                "n_frames": T,
+            }
+
+        threshold = baseline - 500  # 6516 - 500 = 6016
+        below = col2_trace < threshold
+
+        # Find contiguous below-threshold segments
+        diff = np.diff(below.astype(int), prepend=0, append=0)
+        onsets = np.where(diff == 1)[0]
+        offsets = np.where(diff == -1)[0]
+
+        # Filter: pulse width >= 3 frames (отсекает 1-frame артефакты)
+        min_width = 3
+        valid = (offsets - onsets) >= min_width
+        onsets = onsets[valid]
+        offsets = offsets[valid]
+
+        n_pulses = len(onsets)
+        is_paced = n_pulses >= 2  # нужно минимум 2 пульса
+
+        # Compute stim frequency
+        stim_hz = None
+        bcl_ms = None
+        if is_paced:
+            intervals = np.diff(onsets)
+            median_interval = np.median(intervals)
+            if median_interval >= 1:
+                hz = fps / median_interval
+                if 0.5 <= hz <= 50.0:  # sanity
+                    stim_hz = float(hz)
+                    bcl_ms = float(1000.0 / stim_hz)
+
+        # Pulse width
+        pulse_width_ms = None
+        if n_pulses > 0:
+            pulse_widths = offsets - onsets
+            pulse_width_ms = float(np.mean(pulse_widths) / fps * 1000.0)
+
+        method = "col2_drop" if is_paced else "none"
+
+        self.logger.info(
+            f"StimExtract: {n_pulses} pulses, is_paced={is_paced}, "
+            f"stim_hz={stim_hz}, bcl_ms={bcl_ms}, "
+            f"pulse_width={pulse_width_ms:.1f}ms" if pulse_width_ms else
+            f"StimExtract: {n_pulses} pulses, is_paced={is_paced}"
+        )
+
+        return {
+            "stim_trace": col2_trace,
+            "pulse_onsets": onsets,
+            "pulse_offsets": offsets,
+            "stim_hz": stim_hz,
+            "bcl_ms": bcl_ms,
+            "pulse_width_ms": pulse_width_ms,
+            "n_pulses": n_pulses,
+            "is_paced": is_paced,
+            "method": method,
+            "fps": fps,
+            "n_frames": T,
+        }
+
+    def _save_stim_trace_png(
+        self,
+        stim_trace: np.ndarray,
+        pulse_onsets: np.ndarray,
+        pulse_offsets: np.ndarray,
+        fps: float,
+        sample_id: str,
+        video: np.ndarray = None,
+    ) -> None:
+        """
+        Сохраняет PNG стим-трейса (col 2) + флуоресцентного трейса (tissue mean).
+
+        Две панели, sharex:
+          top:    col 2 mean — стимуляционный канал, с shading onsets/offsets
+          bottom: tissue fluorescence — mean по tissue cols (20..W-8), rows all
+        """
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            T = len(stim_trace)
+            t_ms = np.arange(T, dtype=np.float64) / fps * 1000.0 if fps else np.arange(T)
+            baseline = np.median(stim_trace)
+            threshold = baseline - 500
+
+            # Tissue fluorescence: mean по tissue-области (cols 20..W-8, все rows)
+            tissue_trace = None
+            if video is not None:
+                T2, H, W = video.shape
+                col_start = min(20, W - 1)
+                col_end = max(col_start + 1, W - 8)
+                tissue_trace = video[:, :, col_start:col_end].mean(axis=(1, 2))
+
+            n_panels = 2 if tissue_trace is not None else 1
+            fig, axes = plt.subplots(
+                n_panels, 1, figsize=(20, 4 * n_panels),
+                sharex=True, gridspec_kw={"hspace": 0.15},
+            )
+            if n_panels == 1:
+                axes = [axes]
+
+            # --- Top: stim channel (col 2) ---
+            ax = axes[0]
+            ax.plot(t_ms, stim_trace, lw=0.5, color="gray", label="col 2 trace")
+            ax.axhline(baseline, color="green", lw=0.8, ls="--", alpha=0.5,
+                       label=f"baseline={baseline:.0f}")
+            ax.axhline(threshold, color="red", lw=0.8, ls="--", alpha=0.5,
+                       label=f"threshold={threshold:.0f}")
+
+            # Shade stim pulses
+            for on, off in zip(pulse_onsets, pulse_offsets):
+                ax.axvspan(
+                    t_ms[on] if on < T else on, t_ms[off] if off < T else off,
+                    color="red", alpha=0.2,
+                )
+
+            ax.set_ylabel("col 2 mean (uint16)")
+            ax.set_title(
+                f"Stim channel — {sample_id} | fps={fps} | "
+                f"N pulses={len(pulse_onsets)}"
+            )
+            ax.legend(loc="upper right", fontsize=8)
+
+            # --- Bottom: tissue fluorescence ---
+            if tissue_trace is not None:
+                ax2 = axes[1]
+                ax2.plot(t_ms, tissue_trace, lw=0.5, color="royalblue",
+                          label="tissue mean (cols 20..W-8)")
+                # Shade stim pulses на нижней панели тоже
+                for on, off in zip(pulse_onsets, pulse_offsets):
+                    ax2.axvspan(
+                        t_ms[on] if on < T else on,
+                        t_ms[off] if off < T else off,
+                        color="red", alpha=0.1,
+                    )
+                ax2.set_xlabel("time [ms]" if fps else "frame")
+                ax2.set_ylabel("fluorescence (a.u.)")
+                ax2.set_title("Tissue fluorescence — spatial mean")
+                ax2.legend(loc="upper right", fontsize=8)
+
+            fig.tight_layout()
+
+            png_path = self.get_path("stim_trace.png", kind="must")
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+            self.logger.info(f"[MUST] Saved: stim_trace.png")
+        except Exception as e:
+            self.logger.warning(f"Stim trace PNG failed: {e}")
 
     def _crop_video(self, video: np.ndarray) -> np.ndarray:
         """Убирает артефактные пиксели по краям матрицы (crop_left / crop_right)."""
@@ -895,6 +1115,40 @@ class LoaderAgent(BaseAgent):
         # --- 4. Загрузка видео + кроп ---
         self.logger.info(f"Загружаю видео: {input_path.name}")
         video = self._load_video(input_path)
+
+        # --- 4a. Извлечение стим-канала (col 2) ДО кропа ---
+        # col 2 (индекс 2) попадает в crop_left=20 и теряется после кропа.
+        # Поэтому читаем ДО _crop_video().
+        stim_result = None
+        try:
+            stim_result = self._extract_stim_from_video(video, fps)
+            if stim_result is not None:
+                # Сохраняем stim trace
+                self.save_must(stim_result["stim_trace"], "stim_trace.npy")
+                # Записываем в metadata
+                metadata["stim_hz"] = stim_result["stim_hz"]
+                metadata["stim_bcl_ms"] = stim_result["bcl_ms"]
+                metadata["stim_n_pulses"] = stim_result["n_pulses"]
+                metadata["stim_is_paced"] = stim_result["is_paced"]
+                metadata["stim_pulse_width_ms"] = stim_result["pulse_width_ms"]
+                metadata["stim_method"] = stim_result["method"]
+                # PNG
+                self._save_stim_trace_png(
+                    stim_result["stim_trace"],
+                    stim_result["pulse_onsets"],
+                    stim_result["pulse_offsets"],
+                    fps,
+                    self.sample_id,
+                    video=video,
+                )
+        except Exception as e:
+            self.logger.warning(f"StimExtract failed: {e}")
+            metadata["stim_method"] = "error"
+
+        # Обновляем metadata.json с stim-инфо
+        self.save_must(metadata, "metadata.json")
+
+        # --- 4b. Кроп ---
         video = self._crop_video(video)
         T, H, W = video.shape
         self.logger.info(f"Видео загружено: {video.shape}, fps={fps}, dye={dye}, mode={recording_mode}")
