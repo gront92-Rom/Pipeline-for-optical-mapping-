@@ -413,15 +413,21 @@ class LoaderAgent(BaseAgent):
         from scipy.signal import find_peaks as _find_peaks
 
         stim_hz = metadata.get("stim_hz_effective") or metadata.get("stim_hz")
-        if not stim_hz or not isinstance(stim_hz, (int, float)) or stim_hz <= 0:
-            stim_hz = 16.0  # fallback (commit d9d8bc3)
-            self.logger.warning(f"Sideline: stim_hz unknown, fallback to {stim_hz} Hz")
+        if not stim_hz or not isinstance(stim_hz, (int, float)) or stim_hz < 1.0:
+            # stim_hz < 1.0 Hz is unrealistic (e.g. stim_hz=500 = pulse interval,
+            # not pacing rate). Fallback to 16 Hz (commit d9d8bc3).
+            old_stim = stim_hz
+            stim_hz = 16.0
+            self.logger.warning(
+                f"Sideline: stim_hz={old_stim} (< 1.0 Hz, unrealistic), "
+                f"fallback to {stim_hz} Hz"
+            )
 
         trace_arr = np.asarray(trace_filtered, dtype=np.float64)
         trace_iqr = np.percentile(trace_arr, 75) - np.percentile(trace_arr, 25)
         trace_std = np.std(trace_arr)
         min_dist = max(int(0.6 * fps / stim_hz), 1)
-        min_prom = max(trace_iqr * 0.5, trace_std * 0.3)
+        min_prom = max(trace_iqr * 0.3, trace_std * 0.2)
 
         peaks, peak_props = _find_peaks(trace_arr, distance=min_dist, prominence=min_prom)
         self.logger.info(
