@@ -21,6 +21,8 @@ loader:
   crop_left: 20
   crop_right: 8
   bytes_per_pixel: 2
+  default_fps: 666.67   # fallback for .npy files w/o metadata
+  default_dye: "A"      # fallback for .npy files
 
 # --- Mask ---
 mask:

@@ -620,14 +620,13 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="Force rerun")
     args = parser.parse_args()
 
-    cfg = PipelineConfig({
-        "results_root": args.results_root,
-        "apd": {
-            "levels": [30, 50, 80],
-            "min_amp_abs": 10.0,
-            "min_amp_noise_mult": 3.0,
-        },
-    })
+    cfg = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
+    cfg.apd = {
+        "levels": [30, 50, 80],
+        "min_amp_abs": 10.0,
+        "min_amp_noise_mult": 3.0,
+    }
     agent = APDAgent(args.sample_id, config=cfg)
     result = agent.run(force=args.force)
     print(result)

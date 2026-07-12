@@ -47,6 +47,7 @@ loader_agent.py — Stage 1: Загрузка данных, извлечение
 
 import json
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
@@ -155,10 +156,42 @@ class LoaderAgent(BaseAgent):
         self.logger.info(f"Кроп: W {W} → {cropped.shape[2]} (left={cl}, right={cr})")
         return cropped
 
+    @staticmethod
+    def _detect_dye_from_filename(filename: str) -> Optional[str]:
+        """
+        Извлекает dye (A/B) из суффикса sample-id в имени файла.
+
+        Нужно для WTtest/TAC/SHAM-стиля 2026 года, где .rsh header не содержит dye
+        (extract_micam_metadata() возвращает dye=None).
+
+        Поддерживаемые паттерны (Roman's WTtest/TAC/SHAM 2026):
+          - '-NNN{A|B}.rsh' / '.gsd' / '.gsh' / '.rsm' / '.rsh.bak'  ('-030A.rsh')
+          - '-NNN{A|B}(N).rsh' / '.rsd'                                ('-030A(0).rsh')
+          - 'NNN{A|B}_bsl-6Hz.rsh'                                     ('002A_bsl-6Hz.rsh')
+          - '...mSHAM-bs2-6Hz-0508-NNN{A|B}.rsh'                       ('...0508-004A.rsh')
+
+        Returns 'A' или 'B' если найдено, иначе None.
+        """
+        # Primary pattern: '-NNN{A|B}' followed by '.', '(' or end of string.
+        m = re.search(r'[-_](\d{2,4})([AB])(?:\.|\(|$)', filename, re.IGNORECASE)
+        if m:
+            return m.group(2).upper()
+        # Fallback (SHAM-style): 'NNN{A|B}' followed by '.', '_', '-' or end.
+        m = re.search(r'(\d{2,4})([AB])(?:[._\-]|$)', filename, re.IGNORECASE)
+        if m:
+            return m.group(2).upper()
+        return None
+
     def _extract_metadata(self, input_path: Path) -> Dict[str, Any]:
         """
         Извлекает метаданные из .bvx/.rsh/.gsh или строит минимальный словарь для .npy.
         Всегда сохраняет metadata.json в must/.
+
+        Dye auto-detection:
+          Если metadata_extractor (или npy-fallback) не вернул dye — пробуем парсить
+          суффикс sample-id в имени файла (WTtest/TAC/SHAM 2026: -030A.rsh → 'A').
+          Устанавливает meta['dye_source'] в 'metadata_header' | 'filename_suffix'
+          | 'config_default' | None.
         """
         ext = input_path.suffix.lower()
 
@@ -186,6 +219,46 @@ class LoaderAgent(BaseAgent):
             meta["sample_id"] = self.sample_id
             meta["source_file"] = str(input_path)
 
+        # --- Dye auto-detection (WTtest/TAC/SHAM 2026: .rsh header не содержит dye) ---
+        # Применяем и для MiCAM-ветки, и для .npy-fallback, чтобы sideline/preprocess
+        # корректно выбирали инверсию для VSD (dye A) vs CaT (dye B).
+        dye_existing = meta.get("dye")
+        dye_source_existing = meta.get("dye_source")
+
+        if dye_existing not in (None, ""):
+            # extract_micam_metadata уже нашёл dye из header (.bvx/.rsh) или filename.
+            # Сохраняем источник: 'metadata_header' (bvx/rsh) или 'filename' (metadata_extractor).
+            if not dye_source_existing:
+                meta["dye_source"] = "metadata_header"
+        else:
+            # Пробуем парсить суффикс sample-id из имени файла.
+            detected = self._detect_dye_from_filename(input_path.name)
+            if detected is not None:
+                meta["dye"] = detected
+                meta["dye_source"] = "filename_suffix"
+                self.logger.info(
+                    f"dye auto-detected from filename suffix: {detected}"
+                )
+            else:
+                # Остался None. Если конфиг дал default_dye — используем его.
+                cfg_default_dye = (
+                    self.config.loader.get("default_dye")
+                    if isinstance(self.config.loader, dict) else None
+                )
+                if cfg_default_dye:
+                    meta["dye"] = cfg_default_dye
+                    meta["dye_source"] = "config_default"
+                else:
+                    meta["dye_source"] = None
+
+        # Recording_mode из dye (если ещё не выставлен)
+        if meta.get("recording_mode") is None and meta.get("dye"):
+            d = str(meta["dye"]).upper().strip()
+            if d.startswith("A"):
+                meta["recording_mode"] = "voltage"
+            elif d.startswith("B"):
+                meta["recording_mode"] = "calcium"
+
         # Всегда записываем в must/metadata.json
         self.save_must(meta, "metadata.json")
         return meta
@@ -193,22 +266,253 @@ class LoaderAgent(BaseAgent):
     def _handle_sideline(self, video: np.ndarray, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
         Sideline-режим для длинных записей (>= sideline_threshold кадров).
-        Сохраняет только усреднённый трейс центрального 3×3 ROI.
+
+        Шаги:
+          1. Среднее центрального 3×3 ROI → raw trace.
+          2. Инверсия для VSD (dye=A): trace = -trace — пики AP смотрят ВВЕРХ
+             (та же логика, что и preprocess_video() для VSD).
+             Для CaT (dye=B) — без инверсии.
+          3. Gaussian LPF 100 Hz (sigma_frames = fps / (2π·100)).
+          4. Сохранение:
+             - debug/sideline_trace.npy     — финальный трейс (после инверсии + LPF)
+             - debug/sideline_trace_raw.npy — сырой ROI trace (до обработки, для отладки)
         """
         T, H, W = video.shape
         cy, cx = H // 2, W // 2
         y0, y1 = max(0, cy - 1), min(H, cy + 2)
         x0, x1 = max(0, cx - 1), min(W, cx + 2)
-        trace = np.mean(video[:, y0:y1, x0:x1], axis=(1, 2)).astype(np.float32)
+        trace_raw = np.mean(video[:, y0:y1, x0:x1], axis=(1, 2)).astype(np.float32)
+
+        # 2. Инверсия для VSD (dye A) — как в preprocess_video()
+        dye = metadata.get("dye")
+        if isinstance(dye, str) and dye.strip().upper().startswith("A"):
+            trace = -trace_raw
+            self.logger.info("Sideline: применена инверсия (VSD/dye A)")
+        else:
+            trace = trace_raw.copy()
+            self.logger.info("Sideline: инверсия НЕ применена (CaT/dye B или неизвестно)")
+
+        # 3. Gaussian LPF 100 Hz (только если fps известен)
+        fps = metadata.get("fps")
+        lp_cutoff_hz = 100.0
+        if isinstance(fps, (int, float)) and fps > 0:
+            sigma_frames = float(fps) / (2.0 * np.pi * lp_cutoff_hz)
+            # Симметричный Gaussian FIR (окно ±4σ)
+            radius = max(1, int(np.ceil(4 * sigma_frames)))
+            x = np.arange(-radius, radius + 1, dtype=np.float32)
+            kernel = np.exp(-0.5 * (x / sigma_frames) ** 2).astype(np.float32)
+            kernel /= kernel.sum()
+            # np.convolve с mode='same' — корректный zero-padding
+            trace = np.convolve(trace, kernel, mode="same").astype(np.float32)
+            self.logger.info(
+                f"Sideline: LPF {lp_cutoff_hz} Hz applied (sigma={sigma_frames:.2f} frames @ {fps} Hz)"
+            )
+        else:
+            self.logger.warning(f"Sideline: fps неизвестен ({fps}), LPF пропущен")
+
+        # 4. Сохранение
+        # 5. Trim edge artefacts (LP filter ringing at start/end).
+        # ASLS also drifts at boundaries. Drop ~30ms from each end.
+        n_trim = max(int(fps * 0.030), 5)  # ≥5 samples, ~30ms @any fps
+        if len(trace_raw) > 2 * n_trim + 10 and len(trace) > 2 * n_trim + 10:
+            trace_raw = trace_raw[n_trim:-n_trim]
+            trace     = trace[n_trim:-n_trim]
+            self.logger.info(f"Sideline: trimmed {n_trim} samples ({n_trim/fps*1000:.1f}ms) from each edge")
+        else:
+            self.logger.warning(f"Sideline: trace too short ({len(trace)} samples) to trim, skipped")
+
+        self.save_debug(trace_raw, "sideline_trace_raw.npy")
         self.save_debug(trace, "sideline_trace.npy")
         self.logger.warning(
             f"Sideline-режим: {T} кадров >= порога {self.sideline_threshold}. "
-            "Сохранён только центральный трейс."
+            "Сохранены raw + LP100Hz инвертированный (если dye=A) центральный трейс."
         )
+
+        # 6. Baseline correction: TWO versions
+        #   trace_bc      — для analysis / activation maps (жёсткая, lam=1e7, baseline только DC)
+        #   trace_bc_lite — для peak detection (реактивная, lam=5e5, оставляет amplitude peaks)
+        try:
+            from cardiac_pipeline.utils.preprocess import asls_baseline_correct_trace
+
+            # 6a. Hard baseline — не хватает пики (подходит для analysis)
+            hard_lam = 1e7
+            hard_bl = asls_baseline_correct_trace(trace, lam=hard_lam, p=0.01, niter=3)
+            trace_bc = (trace - hard_bl).astype(np.float32)
+            self.save_debug(hard_bl.astype(np.float32), "sideline_baseline.npy")
+            self.save_debug(trace_bc, "sideline_trace_bc.npy")
+
+            # 6b. Soft baseline — reactive, оставляет пики целыми (для peak detection)
+            soft_lam = 5e5
+            soft_bl = asls_baseline_correct_trace(trace, lam=soft_lam, p=0.01, niter=3)
+            trace_bc_lite = (trace - soft_bl).astype(np.float32)
+            self.save_debug(soft_bl.astype(np.float32), "sideline_baseline_lite.npy")
+            self.save_debug(trace_bc_lite, "sideline_trace_bc_lite.npy")
+
+            self.logger.info(
+                f"Sideline: ASLS baseline correction applied:\n"
+                f"  hard (analysis):  lam={hard_lam:.0e} → sideline_baseline.npy + sideline_trace_bc.npy\n"
+                f"  soft (peak det):  lam={soft_lam:.0e} → sideline_baseline_lite.npy + sideline_trace_bc_lite.npy"
+            )
+        except Exception as e:
+            self.logger.warning(f"ASLS baseline correction failed: {e}, using raw LP trace")
+            trace_bc = trace
+            trace_bc_lite = trace
+
+        # 7. 4-panel PNG (always generated in sideline mode)
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            t_ms = np.arange(len(trace_raw), dtype=np.float64) / fps * 1000.0 if fps else np.arange(len(trace_raw))
+
+            fig, axes = plt.subplots(4, 1, figsize=(20, 10), sharex=True)
+            fig.suptitle(
+                f"Sideline 4-panel — {self.sample_id} | dye={dye} | fps={fps} | T={T}",
+                fontsize=13, fontweight="bold",
+            )
+
+            # Panel 1: raw ROI trace (pre-invert, pre-LPF)
+            axes[0].plot(t_ms, trace_raw, lw=0.5, color="gray")
+            axes[0].set_ylabel("raw ROI")
+            axes[0].set_title("1. Raw central 3×3 mean (pre-invert, pre-LPF)")
+
+            # Panel 2: oriented + LPF 100Hz
+            axes[1].plot(t_ms, trace, lw=0.5, color="C0")
+            axes[1].set_ylabel("LPF 100Hz")
+            axes[1].set_title(f"2. After {'invert + ' if isinstance(dye, str) and dye.strip().upper().startswith('A') else ''}Gaussian LPF 100 Hz")
+
+            # Panel 3: ASLS hard baseline-corrected (analysis)
+            axes[2].plot(t_ms, trace_bc, lw=0.5, color="C1")
+            axes[2].set_ylabel("BC hard")
+            axes[2].set_title("3. ASLS hard baseline (lam=1e7) — for analysis")
+
+            # Panel 4: ASLS soft baseline-corrected (peak detection)
+            axes[4-1].plot(t_ms, trace_bc_lite, lw=0.5, color="C2")
+            axes[4-1].set_ylabel("BC lite")
+            axes[4-1].set_title("4. ASLS soft baseline (lam=5e5) — for peak detection")
+            axes[4-1].set_xlabel("time [ms]" if fps else "frame")
+
+            fig.tight_layout(rect=[0, 0, 1, 0.95])
+            png_path = self.get_path("sideline_4panel.png", kind="must")
+            fig.savefig(png_path, dpi=150)
+            plt.close(fig)
+            self.logger.info(f"[MUST] Sideline 4-panel PNG saved: {png_path.name}")
+        except Exception as e_png:
+            self.logger.warning(f"Sideline 4-panel PNG failed: {e_png}")
+
         return {
             "status":   "sideline",
             "n_frames": T,
             "shape":    list(video.shape),
+            "dye":      dye,
+            "inverted": isinstance(dye, str) and dye.strip().upper().startswith("A"),
+            "lp_cutoff_hz": lp_cutoff_hz,
+            "baseline_corrected": True,
+            "asls_hard_lam": 1e7,
+            "asls_soft_lam": 5e5,
+            "trim_samples": n_trim,
+            "trim_seconds": n_trim / fps if fps else None,
+        }
+
+    def _sideline_branch(
+        self,
+        video: np.ndarray,
+        metadata: Dict[str, Any],
+        fps: float,
+        T: int,
+        H: int,
+        W: int,
+        t0: float,
+    ) -> Dict[str, Any]:
+        """
+        Ветка sideline: вызывается из run() при T >= sideline_threshold.
+        Делает ТОЛЬО:
+          1. Удаляет случайный raw_video.npy (на случай если что-то пошло не так).
+          2. _handle_sideline() — пишет debug/sideline_trace.npy.
+          3. Сигнал-оператору debug/sideline_guide.txt с объяснением.
+          4. Сохраняет метрики в must/metrics.json (loader_mode='sideline').
+          5. Возвращает спецификационный словарь. НЕ вызывает preprocess_video().
+        """
+        # 1. Гарантируем отсутствие raw_video.npy (sideline не должен его писать).
+        raw_video_path = self.get_path("raw_video.npy", kind="must")
+        if raw_video_path.exists():
+            try:
+                raw_video_path.unlink()
+                self.logger.info("Удалён случайно сохранённый raw_video.npy (sideline).")
+            except OSError as e:
+                self.logger.warning(f"Не удалось удалить raw_video.npy: {e}")
+
+        # 2. Сохранить усреднённый трейс центрального ROI.
+        self._handle_sideline(video, metadata)
+
+        # 3. Сигнал-оператору: что произошло и что делать.
+        recording_mode = metadata.get("recording_mode")
+        dye = metadata.get("dye")
+        guide = (
+            "SIDELINE-режим (длинная запись)\n"
+            "================================\n"
+            f"loader_mode             : sideline\n"
+            f"status                  : пропущена полная предобработка\n"
+            f"n_frames                : {T}\n"
+            f"shape (T,H,W)           : {T}x{H}x{W}\n"
+            f"fps                     : {fps}\n"
+            f"dye                     : {dye}\n"
+            f"recording_mode          : {recording_mode}\n"
+            f"sideline_threshold      : {self.sideline_threshold}\n"
+            "\n"
+            "Что сохранено:\n"
+            "  must/metadata.json     — метаданные (fps, dye, stim_hz, companion_files)\n"
+            "  debug/sideline_trace.npy — усреднённый трейс центрального 3x3 ROI\n"
+            "  debug/sideline_guide.txt — этот файл\n"
+            "\n"
+            "Что НЕ сохранено (для экономии RAM):\n"
+            "  raw_video.npy          — сырое видео (сэкономлено ~{:.1f} MB)\n"
+            "  preproc_video.npy      — 80 Hz LPF активационный канал\n"
+            "  preproc_video_apd.npy  — 150 Hz LPF APD-канал\n"
+            "  raw_rsm.npy            — фон-кадр из .rsm\n"
+            "\n"
+            "Что делать дальше:\n"
+            "  1. Использовать SidelineAgent для быстрой sanity-проверки\n"
+            "     (activation, APD, alternans) по центральному трейсу.\n"
+            "  2. Если нужен полный пайплайн — уменьшить T (crop по времени)\n"
+            "     или поднять self.sideline_threshold в config/loader.\n"
+            "  3. Запустить: python -m cardiac_pipeline.agents.sideline_agent <sample_id>\n"
+        ).format(T * H * W * 4 / (1024 ** 2))
+        # save_debug() не поддерживает str — пишем вручную (как .json для консистентности).
+        guide_path = self.get_path("sideline_guide.txt", kind="debug")
+        with open(guide_path, "w", encoding="utf-8") as f:
+            f.write(guide)
+        self.logger.info(f"[DEBUG] Saved: {guide_path.name}")
+
+        # 4. Метрики (loader_mode='sideline' — ключевой маркер).
+        elapsed = round(time.perf_counter() - t0, 2)
+        self._log_metrics({
+            "loader_mode":          "sideline",
+            "n_frames":             T,
+            "height":               H,
+            "width":                W,
+            "fps":                  fps,
+            "dye":                  metadata.get("dye"),
+            "recording_mode":       recording_mode,
+            "stim_hz":              metadata.get("stim_hz"),
+            "stim_hz_effective":    metadata.get("stim_hz_effective"),
+            "sideline_threshold":   self.sideline_threshold,
+            "elapsed_s":            elapsed,
+        })
+
+        self.logger.warning(
+            f"LoaderAgent SIDELINE in {elapsed}s — "
+            f"raw_video.npy/preproc*.npy НЕ сохранены (T={T} >= {self.sideline_threshold}). "
+            f"См. debug/sideline_guide.txt"
+        )
+
+        return {
+            "status":             "sideline",
+            "sideline_threshold": self.sideline_threshold,
+            "n_frames":           T,
+            "fps":                fps,
+            "elapsed_s":          elapsed,
         }
 
     # ------------------------------------------------------------------
@@ -344,8 +648,8 @@ class LoaderAgent(BaseAgent):
           2. Разрешение пути к входному файлу
           3. Извлечение метаданных → metadata.json
           4. Загрузка видео + кроп
-          5. Сохранение raw_video.npy
-          6. Sideline-гейтинг (длинные записи)
+          5. Sideline-гейт (T >= sideline_threshold → ветка sideline, return)
+          6. Сохранение raw_video.npy
           7. Предобработка activation (80 Гц) → preproc_video.npy
           8. Предобработка APD (150 Гц) → preproc_video_apd.npy
           9. Сохранение метрик
@@ -419,8 +723,13 @@ class LoaderAgent(BaseAgent):
         # Сохраняем обновлённые метаданные
         self.save_must(metadata, "metadata.json")
 
-        # --- 5. Сохранение сырого видео ---
-        self.save_must(video, "raw_video.npy")
+        # --- 5. Sideline-гейт: длинные записи (T >= sideline_threshold) ---
+        # Спецификация: НЕ сохраняем raw_video.npy, НЕ вызываем preprocess_video().
+        # Только усреднённый трейс центрального ROI + объяснение в debug/sideline_guide.txt.
+        # Cache-скип ниже гарантированно не блокирует sideline (для sideline preproc_video.npy
+        # никогда не создаётся), поэтому force=False достаточно для перезапуска.
+        if T >= self.sideline_threshold:
+            return self._sideline_branch(video, metadata, fps, T, H, W, t0)
 
         # --- 5b. Загрузка .rsm (background frame) для MaskAgent PRIMARY ---
         rsm_path = input_path.with_suffix(".rsm")
@@ -447,13 +756,8 @@ class LoaderAgent(BaseAgent):
         else:
             self.logger.info(f".rsm не найден рядом с {input_path.name} — MaskAgent будет использовать fallback")
 
-        # --- 6. Sideline-гейтинг ---
-        if T >= self.sideline_threshold:
-            result = self._handle_sideline(video, metadata)
-            elapsed = round(time.perf_counter() - t0, 2)
-            result["elapsed_s"] = elapsed
-            self._log_metrics({"loader_mode": "sideline", "n_frames": T, "elapsed_s": elapsed})
-            return result
+        # --- 6. Сохранение сырого видео ---
+        self.save_must(video, "raw_video.npy")
 
         # --- 7. Предобработка activation (80 Гц) → must/preproc_video.npy ---
         # Variant A (2026-07-09): preproc_video.npy — MUST (не debug).
@@ -549,7 +853,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    cfg   = PipelineConfig({"results_root": args.results_root})
+    cfg   = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
     agent = LoaderAgent(args.sample_id, config=cfg)
 
     try:

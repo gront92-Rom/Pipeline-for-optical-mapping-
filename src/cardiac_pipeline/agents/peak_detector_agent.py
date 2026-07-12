@@ -612,16 +612,15 @@ if __name__ == "__main__":
     parser.add_argument("--results-root", default="results")
     args = parser.parse_args()
 
-    cfg = PipelineConfig({
-        "results_root": args.results_root,
-        "peak_detector": {
-            "threshold_frac":      0.5,
-            "sigma_temporal":      3.0,
-            "min_distance_factor": 0.6,
-            "drop_first":          False,
-            "min_peaks":           3,
-        },
-    })
+    cfg = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
+    cfg.peak_detector = {
+        "threshold_frac":      0.5,
+        "sigma_temporal":      3.0,
+        "min_distance_factor": 0.6,
+        "drop_first":          False,
+        "min_peaks":           3,
+    }
 
     agent = PeakDetectorAgent(args.sample_id, config=cfg)
     result = agent.run()

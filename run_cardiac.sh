@@ -185,6 +185,7 @@ sys.path.insert(0, os.environ.get("PIPELINE_SRC", "src"))
 
 from cardiac_pipeline.base_agent import PipelineConfig
 from cardiac_pipeline.agents.loader_agent import LoaderAgent
+from cardiac_pipeline.agents.sideline_agent import SidelineAgent
 from cardiac_pipeline.agents.mask_agent import MaskAgent
 from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
 from cardiac_pipeline.agents.activation_agent import ActivationAgent
@@ -259,15 +260,16 @@ def main() -> int:
     })
 
     stages = [
-        ("1/9 Loader",        LoaderAgent,        {"input_path": INPUT_FILE, "force": True}),
-        ("2/9 Mask",          MaskAgent,          {"force": True}),
-        ("3/9 PeakDetector",  PeakDetectorAgent,  {"force": True}),
-        ("4/9 Activation",    ActivationAgent,    {"force": True}),
-        ("5/9 APD",           APDAgent,           {"force": True}),
-        ("6/9 Conduction",    ConductionAgent,    {"force": True}),
-        ("7/9 Alternans",     AlternansAgent,     {"force": True}),
-        ("8/9 Cleaning",      CleaningAgent,      {"force": True}),
-        ("9/9 Report",        ReportAgent,        {"force": True}),
+        ("1/10 Loader",        LoaderAgent,        {"input_path": INPUT_FILE, "force": True}),
+        ("2/10 Sideline",      SidelineAgent,      {"force": True}),
+        ("3/10 Mask",          MaskAgent,          {"force": True}),
+        ("4/10 PeakDetector",  PeakDetectorAgent,  {"force": True}),
+        ("5/10 Activation",    ActivationAgent,    {"force": True}),
+        ("6/10 APD",           APDAgent,           {"force": True}),
+        ("7/10 Conduction",    ConductionAgent,    {"force": True}),
+        ("8/10 Alternans",     AlternansAgent,     {"force": True}),
+        ("9/10 Cleaning",      CleaningAgent,      {"force": True}),
+        ("10/10 Report",       ReportAgent,        {"force": True}),
     ]
 
     results = {
@@ -300,6 +302,21 @@ def main() -> int:
                 "elapsed_s": round(elapsed, 2),
             }
             print(f"  ✓ OK in {elapsed:.1f}s", flush=True)
+
+            # --- SIDELINE GATE: stop standard pipeline for long files ---
+            if AgentClass is SidelineAgent and isinstance(result, dict) and result.get("status") == "sideline":
+                print("\n[SIDELINE GATE] Long file detected — standard spatial pipeline halted.", flush=True)
+                print(f"  Frames: {result.get('frames')}", flush=True)
+                print(f"  Peaks: {result.get('n_peaks')}", flush=True)
+                print(f"  Dominant freq: {result.get('dominant_freq_hz')} Hz", flush=True)
+                print(f"  PNG: {result.get('png_path')}", flush=True)
+                print(f"  Decision request: {result.get('request_path')}", flush=True)
+                print("\nTo continue:", flush=True)
+                print("  • Review sideline_trace.png and sideline_segments.json", flush=True)
+                print("  • Write your decision to results/<sample>/must/sideline_decision.json", flush=True)
+                print("  • Then run the pipeline again with --continue-sideline", flush=True)
+                overall_ok = True  # not a failure, just a controlled stop
+                break
 
         except Exception as exc:
             elapsed = time.time() - t0

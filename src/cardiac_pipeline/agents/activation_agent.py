@@ -305,7 +305,8 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    cfg = PipelineConfig({"results_root": args.results_root})
+    cfg = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
     agent = ActivationAgent(args.sample_id, config=cfg)
     result = agent.run(force=args.force)
     print(json.dumps(result, indent=2, default=str))

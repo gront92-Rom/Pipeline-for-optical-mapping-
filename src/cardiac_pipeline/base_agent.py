@@ -152,6 +152,11 @@ class BaseAgent(ABC):
         elif isinstance(data, (dict, list)):
             with open(path.with_suffix('.json'), 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+        elif isinstance(data, str):
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(data)
+        else:
+            np.save(path.with_suffix('.npy'), np.asarray(data))
         self.logger.info(f"[DEBUG] Saved: {path.name}")
         return path
 

@@ -556,7 +556,8 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    cfg = PipelineConfig({"results_root": args.results_root})
+    cfg = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
     agent = ConductionAgent(args.sample_id, config=cfg)
     result = agent.run(force=args.force)
     print(result)

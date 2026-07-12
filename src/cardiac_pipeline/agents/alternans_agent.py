@@ -415,7 +415,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    cfg   = PipelineConfig({"results_root": args.results_root})
+    cfg   = PipelineConfig()
+    cfg.results_root = Path(args.results_root)
     agent = AlternansAgent(args.sample_id, config=cfg)
 
     try:
