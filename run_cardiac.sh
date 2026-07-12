@@ -285,12 +285,12 @@ def main() -> int:
             stim_is_paced = meta.get("stim_is_paced", False)
 
             if stim_hz and fluor_hz and stim_is_paced:
-                rel_diff = abs(stim_hz - fluor_hz) / stim_hz
-                if rel_diff < 0.15:
+                abs_diff = abs(stim_hz - fluor_hz)
+                if abs_diff < 1.5:
                     skip_sideline = True
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → match (Δ={rel_diff*100:.1f}%) → skip Sideline", flush=True)
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz → match → skip Sideline", flush=True)
                 else:
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → MISMATCH (Δ={rel_diff*100:.1f}%) → run Sideline", flush=True)
+                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz → MISMATCH → run Sideline", flush=True)
             elif not stim_is_paced:
                 # No stim channel — can't compare, run Sideline for safety
                 print(f"\n[RHYTHM GATE] no stim channel detected → run Sideline", flush=True)
