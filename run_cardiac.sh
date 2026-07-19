@@ -185,7 +185,7 @@ sys.path.insert(0, os.environ.get("PIPELINE_SRC", "src"))
 
 from cardiac_pipeline.base_agent import PipelineConfig
 from cardiac_pipeline.agents.loader_agent import LoaderAgent
-from cardiac_pipeline.agents.sideline_agent import SidelineAgent
+# SidelineAgent class removed (rewritten as functions in commit 3e9ea1c)
 from cardiac_pipeline.agents.mask_agent import MaskAgent
 from cardiac_pipeline.agents.peak_detector_agent import PeakDetectorAgent
 from cardiac_pipeline.agents.activation_agent import ActivationAgent
@@ -260,53 +260,18 @@ def main() -> int:
     })
 
     stages = [
-        ("1/10 Loader",        LoaderAgent,        {"input_path": INPUT_FILE, "force": True}),
-        ("2/10 Sideline",      SidelineAgent,      {"force": True}),
-        ("3/10 Mask",          MaskAgent,          {"force": True}),
-        ("4/10 PeakDetector",  PeakDetectorAgent,  {"force": True}),
-        ("5/10 Activation",    ActivationAgent,    {"force": True}),
-        ("6/10 APD",           APDAgent,           {"force": True}),
-        ("7/10 Conduction",    ConductionAgent,    {"force": True}),
-        ("8/10 Alternans",     AlternansAgent,     {"force": True}),
-        ("9/10 Cleaning",      CleaningAgent,      {"force": True}),
-        ("10/10 Report",       ReportAgent,        {"force": True}),
+        ("1/9 Loader",         LoaderAgent,        {"input_path": INPUT_FILE, "force": True}),
+        ("2/9 Mask",           MaskAgent,          {"force": True}),
+        ("3/9 PeakDetector",   PeakDetectorAgent,  {"force": True}),
+        ("4/9 Activation",     ActivationAgent,    {"force": True}),
+        ("5/9 APD",            APDAgent,           {"force": True}),
+        ("6/9 Conduction",     ConductionAgent,    {"force": True}),
+        ("7/9 Alternans",      AlternansAgent,     {"force": True}),
+        ("8/9 Cleaning",       CleaningAgent,      {"force": True}),
+        ("9/9 Report",         ReportAgent,        {"force": True}),
     ]
 
-    # --- RHYTHM GATE: after Loader, decide whether to run Sideline ---
-    # Run Sideline if: Δ(stim_hz, fluor_hz) > 2 Hz OR stim_coverage < 0.9
-    # Skip Sideline if: stim ≈ fluor (1:1 capture) AND stimulation covers full recording
-    skip_sideline = False
-    try:
-        meta_path = Path(RESULTS_ROOT) / SAMPLE_ID / "must" / "metadata.json"
-        if meta_path.exists():
-            meta = json.load(open(meta_path))
-            stim_hz = meta.get("stim_hz")
-            fluor_hz = meta.get("stim_hz_effective")
-            stim_is_paced = meta.get("stim_is_paced", False)
-            stim_coverage = meta.get("stim_coverage", 0.0)
-
-            if stim_hz and fluor_hz and stim_is_paced:
-                abs_diff = abs(stim_hz - fluor_hz)
-                freq_match = abs_diff < 2.0
-                coverage_ok = stim_coverage >= 0.9
-                if freq_match and coverage_ok:
-                    skip_sideline = True
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → Δ={abs_diff:.2f} Hz, coverage={stim_coverage:.1%} → match → skip Sideline", flush=True)
-                else:
-                    reasons = []
-                    if not freq_match:
-                        reasons.append(f"Δ={abs_diff:.2f} Hz > 2 Hz")
-                    if not coverage_ok:
-                        reasons.append(f"coverage={stim_coverage:.1%} < 90%")
-                    print(f"\n[RHYTHM GATE] stim={stim_hz} Hz vs fluor={fluor_hz} Hz → {' + '.join(reasons)} → run Sideline", flush=True)
-            elif not stim_is_paced:
-                # No stim channel — can't compare, run Sideline for safety
-                print(f"\n[RHYTHM GATE] no stim channel detected → run Sideline", flush=True)
-            else:
-                print(f"\n[RHYTHM GATE] missing stim_hz or fluor_hz → run Sideline", flush=True)
-    except Exception as e:
-        print(f"\n[RHYTHM GATE] error: {e} → run Sideline (safe default)", flush=True)
-
+    # --- Sideline stage removed (rewritten as functions, not Agent class) ---
     results = {
         "sample_id": SAMPLE_ID,
         "input_file": INPUT_FILE,
@@ -324,16 +289,6 @@ def main() -> int:
     last_elapsed = 0.0
 
     for stage_name, AgentClass, kwargs in stages:
-        # Skip Sideline if rhythm gate passed
-        if AgentClass is SidelineAgent and skip_sideline:
-            results["stages"][stage_name] = {
-                "ok": True,
-                "elapsed_s": 0.0,
-                "skipped": "rhythm_gate_match",
-            }
-            print(f"\n=== {stage_name} ===\n  ⊘ SKIPPED (rhythm gate: stim ≈ fluor)", flush=True)
-            continue
-
         t0 = time.time()
         print(f"\n=== {stage_name} ===", flush=True)
 
@@ -347,21 +302,6 @@ def main() -> int:
                 "elapsed_s": round(elapsed, 2),
             }
             print(f"  ✓ OK in {elapsed:.1f}s", flush=True)
-
-            # --- SIDELINE GATE: stop standard pipeline for long files ---
-            if AgentClass is SidelineAgent and isinstance(result, dict) and result.get("status") == "sideline":
-                print("\n[SIDELINE GATE] Long file detected — standard spatial pipeline halted.", flush=True)
-                print(f"  Frames: {result.get('frames')}", flush=True)
-                print(f"  Peaks: {result.get('n_peaks')}", flush=True)
-                print(f"  Dominant freq: {result.get('dominant_freq_hz')} Hz", flush=True)
-                print(f"  PNG: {result.get('png_path')}", flush=True)
-                print(f"  Decision request: {result.get('request_path')}", flush=True)
-                print("\nTo continue:", flush=True)
-                print("  • Review sideline_trace.png and sideline_segments.json", flush=True)
-                print("  • Write your decision to results/<sample>/must/sideline_decision.json", flush=True)
-                print("  • Then run the pipeline again with --continue-sideline", flush=True)
-                overall_ok = True  # not a failure, just a controlled stop
-                break
 
         except Exception as exc:
             elapsed = time.time() - t0
