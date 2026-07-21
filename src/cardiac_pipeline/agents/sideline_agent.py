@@ -6,7 +6,7 @@ Pipeline:
   1. Load .rsh (or .gsd→.rsh fallback) via optimap → (T, 100, 128) video
   2. Stim extraction: col 2 mean → threshold → onsets/offsets/stim_hz
   3. Detect stim BURSTS — group pulses by inter-pulse gaps
-  4. 3×3 ROI (tissue center or frame center) → invert → trim 30ms → ASLS → Butterworth 80Hz
+  4. 3×3 ROI (tissue center or frame center) → invert → trim 30ms → ASLS(p=0.10) → Savitzky-Golay(21,3)
   5. Peak detection on processed trace
   6. For EACH burst:
        - Find last stimulated AP peak in that burst
@@ -48,18 +48,106 @@ STIM_MIN_HZ = 0.5
 
 CROP_LEFT = 20
 CROP_RIGHT = 8
-ASLS_LAM = 1e5
-ASLS_P = 0.01
+ASLS_LAM = 1e6          # changed from 1e5 (2026-07-19) — smoother baseline
+ASLS_P = 0.01           # kept asymmetric — emphasis on positive residuals
 ASLS_NITER = 3
-BUTTERWORTH_CUTOFF_HZ = 80.0
+SAVGOL_WIN = 21         # Savitzky-Golay smoothing window (frames)
+SAVGOL_ORDER = 3        # polynomial order for savgol
 TRIM_MS = 30.0
 
-POST_STIM_WINDOW_SEC = 2.0    # max window after last stimulated AP peak
+POST_STIM_WINDOW_SEC = 0.5      # default 500ms post-stim window (PCS grading works in 500ms window; 2026-07-19)
 DAD_AMP_FRACTION = 0.5        # < 0.5 × stim median amp → DAD
 DEFAULT_FALLBACK_FREQ_HZ = 16.0  # fallback for peak min_dist if stim_hz missing
 
 # Burst detection: gap > BURST_GAP_MULTIPLIER × median_interval → new burst
 BURST_GAP_MULTIPLIER = 3.0
+
+# ── PCS (Premature Complex Score) thresholds ──────────────────────────────
+# Adapted from Lambeth Conventions (Curtis 1988 / 2013) for 500 ms post-stim window (rat)
+# 0 = NONE
+# 1 = single PVC
+# 2 = couplets / salvos (2–4 consecutive peaks)
+# 3 = NSVT (≥5 peaks + fast mean RR)
+# 4 = VT/VF (very high density OR highly irregular)
+
+PCS_RR_VT_MAX_MS = 200.0        # mean RR < 200 ms (≥5 Hz) → qualifies as tachycardic
+PCS_NSVT_MIN_PEAKS = 5          # ≥5 peaks → candidate for NSVT
+PCS_VF_PEAK_DENSITY = 30.0      # ≥30 peaks/sec (≈1800 bpm) → VF-like density
+PCS_VF_RR_CV = 0.60             # RR coefficient of variation > 0.60 → highly irregular
+VF_WINDOW_SEC = 0.5             # window size used for VF density check
+
+# Burst detection: gap > BURST_GAP_MULTIPLIER × median_interval → new burst
+BURST_GAP_MULTIPLIER = 3.0
+
+
+def classify_severity(
+    post_stim_peaks: np.ndarray,
+    fps: float,
+    window_ms: float,
+) -> Dict[str, Any]:
+    """
+    Grade post-stim activity as PCS class 0..4.
+
+    Decision order (highest severity first):
+      4  VT/VF          – density ≥ 30/s  OR  (n≥5 and RR_CV > 0.60)
+      3  NSVT           – n≥5 and mean RR < 200 ms
+      2  COUPLET_SALVO  – 2 ≤ n ≤ 4
+      1  PVC_SINGLE     – n == 1
+      0  NONE           – n == 0
+    """
+    n = len(post_stim_peaks)
+    window_sec = max(window_ms / 1000.0, 1e-6)
+    peak_density = n / window_sec
+
+    if n == 0:
+        return {
+            "pcs_class": 0,
+            "label": "NONE",
+            "n_post_stim": 0,
+            "rr_cv": None,
+            "peak_density_per_sec": round(peak_density, 3),
+        }
+
+    # RR intervals (ms)
+    if n >= 2:
+        rr_ms = np.diff(post_stim_peaks.astype(np.float64)) / fps * 1000.0
+        mean_rr = float(np.mean(rr_ms))
+        std_rr = float(np.std(rr_ms))
+        rr_cv = std_rr / mean_rr if mean_rr > 0 else None
+    else:
+        mean_rr = None
+        rr_cv = None
+
+    # ----- Class 4: VT / VF -----
+    is_vf = (peak_density >= PCS_VF_PEAK_DENSITY) or (
+        n >= PCS_NSVT_MIN_PEAKS and rr_cv is not None and rr_cv > PCS_VF_RR_CV
+    )
+    if is_vf:
+        cls, label = 4, "VT_OR_VF"
+
+    # ----- Class 3: NSVT -----
+    elif (
+        n >= PCS_NSVT_MIN_PEAKS
+        and mean_rr is not None
+        and mean_rr < PCS_RR_VT_MAX_MS
+    ):
+        cls, label = 3, "NSVT"
+
+    # ----- Class 2: couplets / salvos -----
+    elif 2 <= n <= 4:
+        cls, label = 2, "COUPLET_SALVO"
+
+    # ----- Class 1: single PVC -----
+    else:  # n == 1
+        cls, label = 1, "PVC_SINGLE"
+
+    return {
+        "pcs_class": cls,
+        "label": label,
+        "n_post_stim": n,
+        "rr_cv": round(rr_cv, 3) if rr_cv is not None else None,
+        "peak_density_per_sec": round(peak_density, 3),
+    }
 
 
 # ── Step 1: Load video ─────────────────────────────────────────────────────
@@ -257,7 +345,7 @@ def process_3x3_trace(
     dye: str = "A",
 ) -> np.ndarray:
     """
-    3×3 ROI → invert (dye A) → trim 30ms → ASLS(λ=1e5) → Butterworth 80Hz.
+    3×3 ROI → invert (dye A) → trim 30ms → ASLS(p=0.01, λ=1e6) → Savitzky-Golay(21,3).
     Returns processed 1D trace.
     """
     T, H, W = video.shape
@@ -290,18 +378,14 @@ def process_3x3_trace(
         logger.warning(f"ASLS failed ({e}), using raw trace")
         trace_bc = trace
 
-    # 5. Butterworth LPF 80 Hz
-    if fps and fps > 0:
-        try:
-            from scipy.signal import filtfilt, butter
-            wn = min(BUTTERWORTH_CUTOFF_HZ / (fps / 2.0), 0.99)
-            b, a = butter(4, wn, btype='low')
-            trace_filt = filtfilt(b, a, trace_bc).astype(np.float32)
-            logger.info(f"Butterworth LPF: cutoff={BUTTERWORTH_CUTOFF_HZ}Hz, wn={wn:.4f}")
-        except Exception as e:
-            logger.warning(f"Butterworth failed ({e}), using ASLS-only")
-            trace_filt = trace_bc
-    else:
+    # 5. Savitzky-Golay smoothing (window=21, order=3) — preserves peak shape
+    try:
+        from scipy.signal import savgol_filter
+        win = min(SAVGOL_WIN, len(trace_bc) // 2 * 2 + 1)  # must be odd
+        trace_filt = savgol_filter(trace_bc, win, SAVGOL_ORDER).astype(np.float32)
+        logger.info(f"Savitzky-Golay: window={win}, order={SAVGOL_ORDER}")
+    except Exception as e:
+        logger.warning(f"savgol failed ({e}), using ASLS-only")
         trace_filt = trace_bc
 
     return trace_filt
@@ -344,17 +428,21 @@ def align_and_classify_multi(
     bursts: List[Dict[str, Any]],
     fps: float,
     dye: str = "A",
+    post_window_sec: float = None,
 ) -> List[Dict[str, Any]]:
     """
     For each burst:
       - Find stimulated AP peaks within burst [start, end]
       - last_stim_ap_peak = last peak in burst
-      - Window = [last_stim_ap_peak, min(last_stim_ap_peak + 2sec, next_burst_start)]
+      - Window = [last_stim_ap_peak, min(last_stim_ap_peak + post_window_sec, next_burst_start)]
       - Classify post-stim peaks as DAD or spontaneous
       - Latency = first spontaneous peak − last_stim_ap_peak
 
     Returns list of per-burst result dicts.
     """
+    if post_window_sec is None:
+        post_window_sec = POST_STIM_WINDOW_SEC
+    # If we passed the same window_sec already, no override needed.
     if len(peaks) == 0:
         return []
 
@@ -393,13 +481,14 @@ def align_and_classify_multi(
                 "window_end_frame": None,
                 "window_ms": None,
                 "spont_amps": [], "dad_amps": [],
+                **classify_severity(np.array([], dtype=int), fps, 0.0),
             })
             continue
 
         last_stim_ap_peak = int(burst_stim_peaks[-1])
 
-        # Window: [last_stim_ap_peak, min(last_stim_ap_peak + 2sec, next_burst_start)]
-        window_frames_max = int(POST_STIM_WINDOW_SEC * fps)
+        # Window: [last_stim_ap_peak, min(last_stim_ap_peak + post_window_sec, next_burst_start)]
+        window_frames_max = int(post_window_sec * fps)
         window_end_ideal = last_stim_ap_peak + window_frames_max
 
         if next_burst_start is not None and next_burst_start < window_end_ideal:
@@ -412,7 +501,7 @@ def align_and_classify_multi(
             )
         else:
             window_end = window_end_ideal
-            window_ms = POST_STIM_WINDOW_SEC * 1000.0
+            window_ms = post_window_sec * 1000.0
 
         # Stim median amplitude (from this burst's stimulated peaks)
         stim_amps = trace[burst_stim_peaks]
@@ -469,6 +558,7 @@ def align_and_classify_multi(
             "window_ms": round(window_ms, 1),
             "spont_amps": trace[spont_peaks].tolist() if len(spont_peaks) > 0 else [],
             "dad_amps": trace[dad_peaks].tolist() if len(dad_peaks) > 0 else [],
+            **classify_severity(post_stim_peaks, fps, window_ms),
         })
 
     return results
@@ -517,6 +607,10 @@ def save_results(
             "latency_ms": round(br["latency_ms"], 2) if br["latency_ms"] else None,
             "stim_median_amp": round(br["stim_median_amp"], 4) if br["stim_median_amp"] else None,
             "dad_threshold": round(br["dad_threshold"], 4) if br["dad_threshold"] else None,
+            "pcs_class": br.get("pcs_class"),
+            "pcs_label": br.get("label"),
+            "pcs_rr_cv": br.get("rr_cv"),
+            "pcs_peak_density_per_sec": br.get("peak_density_per_sec"),
             "spont_amps": json.dumps([round(a, 2) for a in br.get("spont_amps", [])]),
             "dad_amps": json.dumps([round(a, 2) for a in br.get("dad_amps", [])]),
         })
@@ -550,8 +644,15 @@ def save_results(
             "dad_amp_fraction": DAD_AMP_FRACTION,
             "burst_gap_multiplier": BURST_GAP_MULTIPLIER,
             "asls_lam": ASLS_LAM,
-            "butterworth_cutoff_hz": BUTTERWORTH_CUTOFF_HZ,
+            "asls_p": ASLS_P,
+            "asls_niter": ASLS_NITER,
+            "savgol_win": SAVGOL_WIN,
+            "savgol_order": SAVGOL_ORDER,
             "fallback_freq_hz": DEFAULT_FALLBACK_FREQ_HZ,
+            "pcs_rr_vt_max_ms": PCS_RR_VT_MAX_MS,
+            "pcs_nsvt_min_peaks": PCS_NSVT_MIN_PEAKS,
+            "pcs_vf_peak_density": PCS_VF_PEAK_DENSITY,
+            "pcs_vf_rr_cv": PCS_VF_RR_CV,
         },
     }
     for br in burst_results:
@@ -569,6 +670,10 @@ def save_results(
             "latency_ms": round(br["latency_ms"], 2) if br["latency_ms"] else None,
             "stim_median_amp": br["stim_median_amp"],
             "dad_threshold": br["dad_threshold"],
+            "pcs_class": br.get("pcs_class"),
+            "pcs_label": br.get("label"),
+            "pcs_rr_cv": br.get("rr_cv"),
+            "pcs_peak_density_per_sec": br.get("peak_density_per_sec"),
             "spont_amps": br.get("spont_amps", []),
             "dad_amps": br.get("dad_amps", []),
         })
@@ -756,7 +861,8 @@ def save_png(
             f"Burst {bid}: {br['n_stim_peaks']} stim peaks, "
             f"window={br['window_ms']:.0f}ms, "
             f"spont={br['n_spont']}, DAD={br['n_dad']}, "
-            f"latency={'%.1fms' % br['latency_ms'] if br['latency_ms'] else 'N/A'}"
+            f"latency={'%.1fms' % br['latency_ms'] if br['latency_ms'] else 'N/A'}, "
+            f"PCS={br.get('pcs_class', '?')}({br.get('label', '?')})"
         )
         ax.set_title(title)
         ax.set_xlabel("time [ms]")
@@ -788,8 +894,11 @@ def run(
     fps: float = 500.0,
     dye: str = "A",
     sample_id: str = "",
+    post_window_ms: float = None,
 ) -> Dict[str, Any]:
     """Run full sideline post-pacing analysis pipeline (multi-burst)."""
+    if post_window_ms is None:
+        post_window_ms = POST_STIM_WINDOW_SEC * 1000.0
 
     if not sample_id:
         sample_id = Path(input_path).stem
@@ -800,7 +909,7 @@ def run(
     logger.info(f"=== SidelineAgent v2 (multi-burst): {sample_id} ===")
     logger.info(f"Input: {input_path}")
     logger.info(f"Output: {output_dir}")
-    logger.info(f"fps={fps}, dye={dye}")
+    logger.info(f"fps={fps}, dye={dye}, post_window_ms={post_window_ms}")
 
     # Step 1: Load video
     video, resolved_path = load_video(input_path)
@@ -829,7 +938,9 @@ def run(
     peaks = detect_peaks(trace, fps, stim_hz=stim_hz)
 
     # Step 6: Multi-burst align + classify
-    burst_results = align_and_classify_multi(peaks, trace, bursts, fps, dye=dye)
+    burst_results = align_and_classify_multi(
+        peaks, trace, bursts, fps, dye=dye, post_window_sec=post_window_ms / 1000.0,
+    )
 
     # Step 7: Save table + report
     csv_path, json_path = save_results(
@@ -879,6 +990,10 @@ def main():
     parser.add_argument("--fps", type=float, default=500.0, help="Sampling rate (Hz)")
     parser.add_argument("--dye", default="A", help="Dye type: A=VSD (voltage), B=CaT (calcium)")
     parser.add_argument("--sample-id", default="", help="Override sample ID")
+    parser.add_argument(
+        "--post-window-ms", type=float, default=None,
+        help=f"Post-stim analysis window in ms (default={POST_STIM_WINDOW_SEC * 1000})",
+    )
     args = parser.parse_args()
 
     result = run(
@@ -887,6 +1002,7 @@ def main():
         fps=args.fps,
         dye=args.dye,
         sample_id=args.sample_id,
+        post_window_ms=args.post_window_ms,
     )
 
     print(f"\n{'='*60}")
@@ -898,9 +1014,12 @@ def main():
     print(f"  Total DAD:   {result['total_dad']}")
     for br in result.get("burst_results", []):
         lat = f"{br['latency_ms']:.1f}ms" if br['latency_ms'] else "N/A"
+        pcs_label = br.get("label", "?")
+        pcs_cls = br.get("pcs_class", "?")
         print(f"  Burst {br['burst_id']}: stim={br['n_stim_peaks']}, "
               f"window={br['window_ms']:.0f}ms, "
-              f"spont={br['n_spont']}, DAD={br['n_dad']}, latency={lat}")
+              f"spont={br['n_spont']}, DAD={br['n_dad']}, latency={lat}, "
+              f"PCS={pcs_cls}({pcs_label})")
     print(f"  PNG:  {result['png_path']}")
     print(f"  CSV:  {result['csv_path']}")
     print(f"  JSON: {result['json_path']}")
