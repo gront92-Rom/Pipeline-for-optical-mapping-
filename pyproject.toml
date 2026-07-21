@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cardiac-pipeline"
+version = "0.1.0"
+description = "Cardiac optical mapping analysis pipeline (refactored wrapper)"
+requires-python = ">=3.12"
+readme = "README.md"
+
+# Ключевое — единая CLI entry-point на любой ОС
+[project.scripts]
+cardiac-pipeline = "cardiac_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
